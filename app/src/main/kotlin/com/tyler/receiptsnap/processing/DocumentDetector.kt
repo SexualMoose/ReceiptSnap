@@ -2,62 +2,187 @@ package com.tyler.receiptsnap.processing
 
 import android.graphics.Bitmap
 import android.util.Log
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.opencv.android.Utils
 import org.opencv.core.Core
-import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
-import org.opencv.core.Point
 import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+import org.opencv.core.Point as CvPoint
 
 /**
- * Finds one or more document-like quadrilaterals in a photo. Detection and
- * warping are separate so the review UI can edit the quad set before commit.
+ * Multi-receipt detector. Two pipelines run in sequence:
  *
- * Coordinates in returned Quads are in the *original* bitmap pixel space.
+ *   Primary — text-driven: OCR the photo; single-link-cluster the
+ *   recognized lines by orientation, spatial proximity, and line height;
+ *   return a padded oriented bounding box per cluster.
  *
- * Two filters rule out obvious non-receipts:
- *   - Frame-hugging quads (the entire photo)
- *   - Dark-interior quads (receipts are printed on white/near-white stock)
+ *   Fallback — classical: when OCR yields nothing usable, run an adaptive
+ *   threshold + morphology + connected-components pass that finds
+ *   light-colored rectangular regions against a darker surface.
+ *
+ * The review UI lets the user remove false positives and add anything the
+ * detector missed, so detection errs toward *recall* — we don't gate on
+ * strict keyword/date patterns here (receipts OCR poorly in ways that would
+ * create too many false negatives). Soft scoring is used only to order.
  */
 object DocumentDetector {
 
     private const val TAG = "DocumentDetector"
 
-    private const val WORK_MAX_SIDE = 1600
-    private const val MIN_AREA_FRACTION = 0.01
-    private const val MAX_AREA_FRACTION = 0.55
-    private const val FRAME_MARGIN_PX = 40
+    /**
+     * Max long-side for OCR. ML Kit wants ≥16 px per character. A 200 MP
+     * capture whose receipt fills 15% of the frame has text around 40–60 px
+     * native; at 4000 px work-size that stays well above ML Kit's floor.
+     * 200 MP is ~16 k × 12 k, so 4000 is a 0.25× scale — memory cost
+     * ~64 MB for the scaled ARGB bitmap, tolerable on S26 Ultra.
+     */
+    private const val WORK_MAX_SIDE_OCR = 4000
+    private const val WORK_MAX_SIDE_EDGES = 1600
 
-    /** Minimum mean luma (0–255) for the interior of a detection to count as
-     *  receipt-like. Tuned so cream/pink thermal paper still passes. */
-    private const val MIN_WHITE_LUMA = 150.0
+    // Linking tolerances for single-link clustering. Loose enough that a
+    // receipt with blank sections and slight baseline curl stays one cluster.
+    private const val ANGLE_TOLERANCE_RAD = 10.0 * PI / 180.0
+    private const val LINE_HEIGHT_RATIO_LIMIT = 3.0
+    private const val PERP_GAP_FACTOR = 6.0   // across-line spacing
+    private const val ALONG_GAP_FACTOR = 6.0  // along-line spacing
+    private const val MIN_LINES_PER_CLUSTER = 2
+    private const val PAD_FACTOR = 1.5
 
-    /** Maximum chroma (max-min channel spread) for the interior to still
-     *  count as near-neutral. A bright-red folder, for instance, would score
-     *  high luma but huge chroma and get rejected here. */
-    private const val MAX_WHITE_CHROMA = 70.0
+    // Post-merge tolerances for combining adjacent clusters into one receipt.
+    private const val MERGE_ANGLE_TOLERANCE_RAD = 15.0 * PI / 180.0
+    private const val MERGE_GAP_FACTOR = 4.0  // permitted gap in units of median line height
+
+    private const val MIN_WHITE_LUMA = 115.0
+    private const val MAX_WHITE_CHROMA = 95.0
+
+    /** Keywords whose presence on a receipt is required for it to be treated
+     *  as a receipt (alongside at least one date). These are the printed
+     *  tokens a real receipt typically carries — not just "TOTAL" which
+     *  appears on lots of non-receipt text. */
+    private val RECEIPT_KEYWORDS = listOf("MERCHANT", "CARDHOLDER", "AUTH", "RESTAURANT")
+
+    /** Phone numbers count as a "phone" marker whether the literal word is
+     *  present or not — most receipts just print the number. */
+    private val PHONE_NUMBER = Regex("\\(?\\d{3}\\)?[\\s.-]?\\d{3}[\\s.-]?\\d{4}")
+
+    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
     data class Quad(
         val id: Long,
-        /** TL, TR, BR, BL in original-image pixel space. */
-        val corners: List<Point>,
-    ) {
-        fun boundsWidth(): Double = corners.maxOf { it.x } - corners.minOf { it.x }
-        fun boundsHeight(): Double = corners.maxOf { it.y } - corners.minOf { it.y }
+        /** TL, TR, BR, BL in original-image pixel space, oriented to the
+         *  cluster's dominant text angle. */
+        val corners: List<CvPoint>,
+    )
+
+    /** Diagnostic counters from the last detection pass. Picked up by the
+     *  review UI so the user can see what the detector saw. */
+    data class DetectionStats(
+        val textLines: Int,
+        val clusters: Int,
+        val fromText: Int,
+        val fromEdges: Int,
+    )
+
+    @Volatile var lastStats: DetectionStats = DetectionStats(0, 0, 0, 0)
+        private set
+
+    suspend fun detect(source: Bitmap): List<Quad> {
+        val lines = recognizeLines(source)
+        Log.i(TAG, "OCR returned ${lines.size} text lines")
+
+        val initialClusters = if (lines.size >= MIN_LINES_PER_CLUSTER) clusterLines(lines) else emptyList()
+        val mergedClusters = mergeAdjacentClusters(initialClusters)
+        Log.i(TAG, "Clusters: ${initialClusters.size} → ${mergedClusters.size} after merge")
+
+        val receiptClusters = mergedClusters.filter(::isReceiptCluster)
+        Log.i(TAG, "${receiptClusters.size} cluster(s) passed date+keyword gate")
+
+        val textQuads = if (receiptClusters.isNotEmpty()) {
+            val full = Mat().also { Utils.bitmapToMat(source, it) }
+            try {
+                var id = 1L
+                receiptClusters
+                    .map { clusterToQuad(it, id++) }
+                    .filter { hasLightInterior(full, it.corners) }
+            } finally {
+                full.release()
+            }
+        } else emptyList()
+
+        val fromEdgesQuads = if (textQuads.isEmpty()) {
+            Log.i(TAG, "Text-driven detection empty — trying classical fallback")
+            detectFromEdges(source, startId = 1L)
+        } else emptyList()
+
+        val result = (textQuads + fromEdgesQuads).distinct()
+        lastStats = DetectionStats(
+            textLines = lines.size,
+            clusters = mergedClusters.size,
+            fromText = textQuads.size,
+            fromEdges = fromEdgesQuads.size,
+        )
+        Log.i(TAG, "Final stats: $lastStats")
+        return result
     }
 
-    fun detect(source: Bitmap): List<Quad> {
-        val full = Mat().also { Utils.bitmapToMat(source, it) }
-        try {
-            return findDocuments(full, source.width, source.height)
-        } finally {
-            full.release()
+    suspend fun growFromSeed(source: Bitmap, seedX: Double, seedY: Double, nextId: Long): Quad? {
+        val lines = recognizeLines(source)
+        if (lines.isEmpty()) return null
+
+        val diag = sqrt(source.width.toDouble() * source.width + source.height.toDouble() * source.height)
+        val seedPoint = CvPoint(seedX, seedY)
+        val nearest = lines.minByOrNull { distance(it.center, seedPoint) } ?: return null
+        if (distance(nearest.center, seedPoint) > diag * 0.18) return null
+
+        // BFS grow: start with `nearest`; pull in any line compatible with the
+        // growing frontier's median angle/height. Lets the user add a missed
+        // receipt by tapping anywhere inside its text block.
+        val members = mutableListOf(nearest)
+        val remaining = lines.toMutableSet().also { it.remove(nearest) }
+        var changed = true
+        while (changed) {
+            changed = false
+            val mAngle = median(members.map { it.angleRad })
+            val mHeight = median(members.map { it.height })
+            val iter = remaining.iterator()
+            while (iter.hasNext()) {
+                val candidate = iter.next()
+                val attachesTo = members.any { other ->
+                    compatible(candidate, other, mAngle, mHeight)
+                }
+                if (attachesTo) {
+                    members += candidate
+                    iter.remove()
+                    changed = true
+                }
+            }
         }
+        if (members.size < MIN_LINES_PER_CLUSTER) {
+            // Return a minimal starter box around the single line rather than
+            // nothing — the user has handles to adjust.
+            val cluster = Cluster(listOf(nearest), nearest.angleRad, nearest.height)
+            return clusterToQuad(cluster, nextId)
+        }
+        return clusterToQuad(buildCluster(members), nextId)
     }
 
     fun warp(source: Bitmap, quad: Quad): Bitmap {
@@ -69,209 +194,347 @@ object DocumentDetector {
         }
     }
 
-    /**
-     * Tap-to-add: grow a document-shaped region from a user-tapped seed pixel
-     * by flood-filling in pixels whose color is close to the seed's. Returns
-     * null when nothing receipt-like can be grown; the caller should then
-     * fall back to a placeholder rectangle.
-     */
-    fun growFromSeed(source: Bitmap, seedX: Double, seedY: Double, nextId: Long): Quad? {
-        val full = Mat().also { Utils.bitmapToMat(source, it) }
-        val work = Mat()
-        val scale = scaleToWorking(full, work)
-        try {
-            val workW = work.cols(); val workH = work.rows()
-            val workX = (seedX * scale).toInt().coerceIn(0, workW - 1)
-            val workY = (seedY * scale).toInt().coerceIn(0, workH - 1)
+    // --- text-driven pipeline ----------------------------------------------
 
-            val bgr = Mat()
-            Imgproc.cvtColor(work, bgr, Imgproc.COLOR_RGBA2BGR)
+    private data class LineInfo(
+        val text: String,
+        val corners: List<CvPoint>, // TL, TR, BR, BL in source image coords
+        val center: CvPoint,
+        val angleRad: Double,
+        val height: Double,
+        val width: Double,
+    )
 
-            // floodFill with FLOODFILL_MASK_ONLY writes the connected region
-            // into `mask` without modifying `bgr`. `mask` must be H+2 × W+2.
-            val mask = Mat.zeros(workH + 2, workW + 2, CvType.CV_8UC1)
-            val loDiff = Scalar(12.0, 12.0, 12.0)
-            val upDiff = Scalar(12.0, 12.0, 12.0)
-            val flags = 4 or (255 shl 8) or
-                Imgproc.FLOODFILL_FIXED_RANGE or Imgproc.FLOODFILL_MASK_ONLY
+    private data class Cluster(
+        val lines: List<LineInfo>,
+        val medianAngleRad: Double,
+        val medianHeight: Double,
+    )
 
-            Imgproc.floodFill(
-                bgr, mask, Point(workX.toDouble(), workY.toDouble()),
-                Scalar(255.0, 255.0, 255.0), Rect(), loDiff, upDiff, flags,
+    private suspend fun recognizeLines(source: Bitmap): List<LineInfo> {
+        val maxSide = max(source.width, source.height)
+        val scale: Double = if (maxSide > WORK_MAX_SIDE_OCR) WORK_MAX_SIDE_OCR.toDouble() / maxSide else 1.0
+        val scaled = if (scale < 1.0) {
+            Bitmap.createScaledBitmap(
+                source,
+                (source.width * scale).toInt(),
+                (source.height * scale).toInt(),
+                true,
             )
+        } else source
+        Log.i(TAG, "OCR input ${scaled.width}×${scaled.height} (scale=${"%.3f".format(scale)})")
 
-            // Clean the mask a bit so small gaps inside the region (printed
-            // text) don't poke holes through the final contour.
-            val maskROI = mask.submat(Rect(1, 1, workW, workH)).clone()
-            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
-            Imgproc.morphologyEx(maskROI, maskROI, Imgproc.MORPH_CLOSE, kernel, Point(-1.0, -1.0), 2)
+        val text = runOcr(scaled)
+        if (scaled !== source) scaled.recycle()
+
+        val invScale = 1.0 / scale
+        val out = mutableListOf<LineInfo>()
+        for (block in text.textBlocks) {
+            for (line in block.lines) {
+                val cp = line.cornerPoints ?: continue
+                if (cp.size != 4) continue
+                val tl = CvPoint(cp[0].x * invScale, cp[0].y * invScale)
+                val tr = CvPoint(cp[1].x * invScale, cp[1].y * invScale)
+                val br = CvPoint(cp[2].x * invScale, cp[2].y * invScale)
+                val bl = CvPoint(cp[3].x * invScale, cp[3].y * invScale)
+                val angle = atan2(tr.y - tl.y, tr.x - tl.x)
+                val height = (distance(tl, bl) + distance(tr, br)) / 2.0
+                val width = (distance(tl, tr) + distance(bl, br)) / 2.0
+                if (height < 6.0) continue
+                val center = CvPoint(
+                    (tl.x + tr.x + br.x + bl.x) / 4.0,
+                    (tl.y + tr.y + br.y + bl.y) / 4.0,
+                )
+                out += LineInfo(line.text, listOf(tl, tr, br, bl), center, angle, height, width)
+            }
+        }
+        return out
+    }
+
+    private suspend fun runOcr(bitmap: Bitmap): Text = suspendCancellableCoroutine { cont ->
+        val img = InputImage.fromBitmap(bitmap, 0)
+        recognizer.process(img)
+            .addOnSuccessListener { cont.resume(it) }
+            .addOnFailureListener { cont.resumeWithException(it) }
+    }
+
+    /**
+     * Single-link clustering over all lines — no angle buckets. Two lines are
+     * linked when they share orientation (within ANGLE_TOLERANCE), similar
+     * line height (within LINE_HEIGHT_RATIO_LIMIT), and are spatially close
+     * in the rotated local frame (PERP_GAP_FACTOR across text, ALONG_GAP_FACTOR
+     * along text). Connected components become clusters.
+     */
+    private fun clusterLines(lines: List<LineInfo>): List<Cluster> {
+        val n = lines.size
+        if (n < MIN_LINES_PER_CLUSTER) return emptyList()
+
+        val adj = Array(n) { mutableListOf<Int>() }
+        for (i in 0 until n) for (j in i + 1 until n) {
+            val mAngle = averageAngle(lines[i].angleRad, lines[j].angleRad)
+            val mHeight = (lines[i].height + lines[j].height) / 2.0
+            if (compatible(lines[i], lines[j], mAngle, mHeight)) {
+                adj[i] += j
+                adj[j] += i
+            }
+        }
+
+        val visited = BooleanArray(n)
+        val components = mutableListOf<MutableList<Int>>()
+        for (start in 0 until n) {
+            if (visited[start]) continue
+            val comp = mutableListOf<Int>()
+            val queue = ArrayDeque<Int>().apply { add(start) }
+            visited[start] = true
+            while (queue.isNotEmpty()) {
+                val v = queue.removeFirst()
+                comp += v
+                for (u in adj[v]) if (!visited[u]) {
+                    visited[u] = true
+                    queue += u
+                }
+            }
+            components += comp
+        }
+
+        return components
+            .filter { it.size >= MIN_LINES_PER_CLUSTER }
+            .map { idx -> buildCluster(idx.map { lines[it] }) }
+    }
+
+    private fun compatible(
+        a: LineInfo, b: LineInfo, medianAngle: Double, medianHeight: Double,
+    ): Boolean {
+        if (angleDistance(a.angleRad, b.angleRad) > ANGLE_TOLERANCE_RAD) return false
+        val hRatio = max(a.height, b.height) / min(a.height, b.height)
+        if (hRatio > LINE_HEIGHT_RATIO_LIMIT) return false
+
+        val perp = perpDistance(a.center, b.center, medianAngle)
+        val along = alongDistance(a.center, b.center, medianAngle)
+
+        // Across-lines: typical receipt leading is ~1.2× height; allow 2.5×
+        // to tolerate blank lines between sections.
+        if (perp > PERP_GAP_FACTOR * medianHeight) return false
+        // Along-line: two pieces of text on the same physical line sometimes
+        // get split by OCR. Allow their centers to be far apart but not
+        // arbitrarily so — bounded by mean-width + ALONG_GAP_FACTOR·height.
+        val meanWidth = (a.width + b.width) / 2.0
+        if (along > meanWidth + ALONG_GAP_FACTOR * medianHeight) return false
+        return true
+    }
+
+    private fun buildCluster(members: List<LineInfo>): Cluster =
+        Cluster(members, median(members.map { it.angleRad }), median(members.map { it.height }))
+
+    /**
+     * Agglomerative merge over the micro-clusters produced by single-link.
+     * Small clusters that belong to the same receipt (but were split by a
+     * blank section or a slightly rotated mid-receipt paragraph) get
+     * re-joined by their oriented bounding boxes: if the local-frame
+     * rectangles overlap or are within MERGE_GAP_FACTOR × median line
+     * height of each other and the cluster angles are close, combine.
+     */
+    private fun mergeAdjacentClusters(clusters: List<Cluster>): List<Cluster> {
+        if (clusters.size <= 1) return clusters
+        val pool = clusters.toMutableList()
+        var changed = true
+        while (changed) {
+            changed = false
+            outer@ for (i in pool.indices) {
+                for (j in i + 1 until pool.size) {
+                    if (canMerge(pool[i], pool[j])) {
+                        val merged = buildCluster(pool[i].lines + pool[j].lines)
+                        // Remove higher index first so the lower one is still valid.
+                        pool.removeAt(j)
+                        pool.removeAt(i)
+                        pool += merged
+                        changed = true
+                        break@outer
+                    }
+                }
+            }
+        }
+        return pool
+    }
+
+    private fun canMerge(a: Cluster, b: Cluster): Boolean {
+        if (angleDistance(a.medianAngleRad, b.medianAngleRad) > MERGE_ANGLE_TOLERANCE_RAD) return false
+        val mergeAngle = averageAngle(a.medianAngleRad, b.medianAngleRad)
+        val aLoc = localExtents(a.lines.flatMap { it.corners }, mergeAngle)
+        val bLoc = localExtents(b.lines.flatMap { it.corners }, mergeAngle)
+        val gap = maxOf(a.medianHeight, b.medianHeight) * MERGE_GAP_FACTOR
+
+        val uOverlap = intervalsTouch(aLoc.uMin, aLoc.uMax, bLoc.uMin, bLoc.uMax, gap)
+        val vOverlap = intervalsTouch(aLoc.vMin, aLoc.vMax, bLoc.vMin, bLoc.vMax, gap)
+        return uOverlap && vOverlap
+    }
+
+    private data class LocalExtents(val uMin: Double, val uMax: Double, val vMin: Double, val vMax: Double)
+
+    private fun localExtents(points: List<CvPoint>, angle: Double): LocalExtents {
+        val c = cos(-angle); val s = sin(-angle)
+        val us = points.map { it.x * c - it.y * s }
+        val vs = points.map { it.x * s + it.y * c }
+        return LocalExtents(us.min(), us.max(), vs.min(), vs.max())
+    }
+
+    private fun intervalsTouch(a0: Double, a1: Double, b0: Double, b1: Double, gap: Double): Boolean {
+        // Overlap or within gap.
+        return !(a1 + gap < b0 || b1 + gap < a0)
+    }
+
+    /** Receipt validity: at least one date AND at least one of the required
+     *  keywords (merchant/cardholder/auth/restaurant) OR a phone number. */
+    private fun isReceiptCluster(cluster: Cluster): Boolean {
+        val joined = cluster.lines.joinToString("\n") { it.text }
+        val upper = joined.uppercase()
+        val hasKeyword = RECEIPT_KEYWORDS.any { kw ->
+            Regex("\\b$kw\\b").containsMatchIn(upper)
+        } || Regex("\\bPHONE\\b").containsMatchIn(upper) || PHONE_NUMBER.containsMatchIn(joined)
+        if (!hasKeyword) return false
+        val dates = ReceiptParser.allDatesInText(joined)
+        return dates.isNotEmpty()
+    }
+
+    private fun clusterToQuad(cluster: Cluster, id: Long): Quad {
+        val angle = cluster.medianAngleRad
+        val cos = cos(-angle); val sin = sin(-angle)
+        val allCorners = cluster.lines.flatMap { it.corners }
+        val localsU = allCorners.map { it.x * cos - it.y * sin }
+        val localsV = allCorners.map { it.x * sin + it.y * cos }
+
+        val pad = cluster.medianHeight * PAD_FACTOR
+        val u0 = localsU.min() - pad; val u1 = localsU.max() + pad
+        val v0 = localsV.min() - pad; val v1 = localsV.max() + pad
+
+        val cosI = kotlin.math.cos(angle); val sinI = kotlin.math.sin(angle)
+        fun unrot(u: Double, v: Double) = CvPoint(u * cosI - v * sinI, u * sinI + v * cosI)
+
+        return Quad(
+            id = id,
+            corners = listOf(unrot(u0, v0), unrot(u1, v0), unrot(u1, v1), unrot(u0, v1)),
+        )
+    }
+
+    // --- classical fallback -------------------------------------------------
+
+    private fun detectFromEdges(source: Bitmap, startId: Long): List<Quad> {
+        val full = Mat().also { Utils.bitmapToMat(source, it) }
+        try {
+            val work = Mat()
+            val scale = scaleToWorking(full, work, WORK_MAX_SIDE_EDGES)
+            val workW = work.cols(); val workH = work.rows()
+
+            val gray = Mat()
+            Imgproc.cvtColor(work, gray, Imgproc.COLOR_RGBA2GRAY)
+
+            val bin = Mat()
+            // Otsu picks the threshold between the dark surface and white
+            // paper adaptively per image. Works across typical lighting.
+            Imgproc.threshold(gray, bin, 0.0, 255.0, Imgproc.THRESH_BINARY or Imgproc.THRESH_OTSU)
+
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 9.0))
+            Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_CLOSE, kernel)
 
             val contours = mutableListOf<MatOfPoint>()
-            Imgproc.findContours(
-                maskROI, contours, Mat(),
-                Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE,
-            )
+            Imgproc.findContours(bin, contours, Mat(),
+                Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
 
-            mask.release(); maskROI.release(); kernel.release(); bgr.release()
+            gray.release(); bin.release(); kernel.release(); work.release()
 
-            val minArea = workW * workH * 0.005
-            val seedPointWork = Point(workX.toDouble(), workY.toDouble())
+            val minArea = workW * workH * 0.01
+            val maxArea = workW * workH * 0.6
 
-            val containing = contours.filter { c ->
-                val poly = MatOfPoint2f(*c.toArray())
-                Imgproc.contourArea(c) > minArea &&
-                    Imgproc.pointPolygonTest(poly, seedPointWork, false) >= 0
-            }.maxByOrNull { Imgproc.contourArea(it) } ?: return null
+            var id = startId
+            val quads = mutableListOf<Quad>()
+            for (c in contours) {
+                val area = Imgproc.contourArea(c)
+                if (area < minArea || area > maxArea) continue
 
-            val hull = MatOfPoint2f(*containing.toArray())
-            val peri = Imgproc.arcLength(hull, true)
-            val approx = MatOfPoint2f()
-            Imgproc.approxPolyDP(hull, approx, 0.02 * peri, true)
-
-            val cornersUsed: Array<Point> = if (approx.toArray().size == 4) {
-                approx.toArray()
-            } else {
+                val hull = MatOfPoint2f(*c.toArray())
                 val rect = Imgproc.minAreaRect(hull)
-                Array(4) { Point() }.also { rect.points(it) }
-            }
-            if (!isPlausibleQuad(cornersUsed)) return null
+                val w = rect.size.width; val h = rect.size.height
+                if (w < 40 || h < 40) continue
+                val aspect = max(w, h) / min(w, h)
+                if (aspect > 12.0) continue
 
-            val ordered = orderCorners(cornersUsed)
-            val scaledBack = ordered.map { Point(it.x / scale, it.y / scale) }
-            return Quad(id = nextId, corners = scaledBack)
+                val corners = Array(4) { CvPoint() }.also { rect.points(it) }
+                val ordered = orderByAngle(corners, rect.angle * PI / 180.0)
+                val scaledBack = ordered.map { CvPoint(it.x / scale, it.y / scale) }
+                if (hasLightInterior(full, scaledBack)) {
+                    quads += Quad(id = id++, corners = scaledBack)
+                }
+            }
+            return quads.take(8)  // cap — classical fallback can get excited
         } finally {
-            full.release(); work.release()
+            full.release()
         }
     }
 
-    private fun findDocuments(full: Mat, imgW: Int, imgH: Int): List<Quad> {
-        val work = Mat()
-        val scale = scaleToWorking(full, work)
-
-        val gray = Mat()
-        Imgproc.cvtColor(work, gray, Imgproc.COLOR_RGBA2GRAY)
-
-        val blurred = Mat()
-        Imgproc.GaussianBlur(gray, blurred, Size(5.0, 5.0), 0.0)
-
-        val edges = Mat()
-        Imgproc.Canny(blurred, edges, 40.0, 120.0)
-
-        val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
-        Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel, Point(-1.0, -1.0), 2)
-
-        val contours = mutableListOf<MatOfPoint>()
-        Imgproc.findContours(
-            edges, contours, Mat(),
-            Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE,
-        )
-
-        val totalArea = work.size().width * work.size().height
-        val minArea = totalArea * MIN_AREA_FRACTION
-        val maxArea = totalArea * MAX_AREA_FRACTION
-
-        val candidates = mutableListOf<Quad>()
-        var nextId = 1L
-
-        for (c in contours) {
-            val area = Imgproc.contourArea(c)
-            if (area < minArea || area > maxArea) continue
-
-            val hull = MatOfPoint2f(*c.toArray())
-            val peri = Imgproc.arcLength(hull, true)
-            val approx = MatOfPoint2f()
-            Imgproc.approxPolyDP(hull, approx, 0.02 * peri, true)
-
-            val corners = approx.toArray()
-            val cornersUsed: Array<Point> = if (corners.size == 4) corners else {
-                val rect = Imgproc.minAreaRect(hull)
-                if (rect.size.width * rect.size.height < minArea) continue
-                Array(4) { Point() }.also { rect.points(it) }
-            }
-
-            if (!isPlausibleQuad(cornersUsed)) continue
-
-            val ordered = orderCorners(cornersUsed)
-            val scaledBack = ordered.map { Point(it.x / scale, it.y / scale) }
-
-            if (isFullFrame(scaledBack, imgW, imgH)) continue
-            if (!hasLightInterior(full, scaledBack)) continue
-
-            candidates += Quad(id = nextId++, corners = scaledBack)
+    private fun orderByAngle(corners: Array<CvPoint>, angleRad: Double): List<CvPoint> {
+        val cos = cos(-angleRad); val sin = sin(-angleRad)
+        // Sort in rotated local frame: row-major TL, TR, BR, BL.
+        val locals = corners.map { p ->
+            p to (p.x * cos - p.y * sin to p.x * sin + p.y * cos)
         }
-
-        gray.release(); blurred.release(); edges.release(); kernel.release(); work.release()
-
-        return deduplicate(candidates).sortedWith(readingOrder())
+        val sortedByV = locals.sortedBy { it.second.second }
+        val top = sortedByV.take(2).sortedBy { it.second.first }
+        val bot = sortedByV.takeLast(2).sortedBy { it.second.first }
+        return listOf(top[0].first, top[1].first, bot[1].first, bot[0].first)
     }
 
-    /**
-     * Samples a 3×3 grid of patches inside the quad's bounding box and requires
-     * the median patch to be bright and near-neutral. This rejects dark
-     * surfaces (table, book cover) while tolerating cream/pink receipt stock
-     * and the ink used for print.
-     */
-    private fun hasLightInterior(full: Mat, corners: List<Point>): Boolean {
-        val minX = corners.minOf { it.x }; val maxX = corners.maxOf { it.x }
-        val minY = corners.minOf { it.y }; val maxY = corners.maxOf { it.y }
+    private fun scaleToWorking(full: Mat, outWork: Mat, maxSide: Int): Double {
+        val current = max(full.cols(), full.rows())
+        if (current <= maxSide) {
+            full.copyTo(outWork)
+            return 1.0
+        }
+        val s = maxSide.toDouble() / current
+        Imgproc.resize(full, outWork, Size(), s, s, Imgproc.INTER_AREA)
+        return s
+    }
+
+    // --- color sanity -------------------------------------------------------
+
+    private fun hasLightInterior(full: Mat, corners: List<CvPoint>): Boolean {
+        val minX = corners.minOf { it.x }.coerceAtLeast(0.0)
+        val maxX = corners.maxOf { it.x }.coerceAtMost(full.cols().toDouble() - 1)
+        val minY = corners.minOf { it.y }.coerceAtLeast(0.0)
+        val maxY = corners.maxOf { it.y }.coerceAtMost(full.rows().toDouble() - 1)
         val w = (maxX - minX); val h = (maxY - minY)
         if (w < 20 || h < 20) return false
 
-        // Shrink the sampling window a touch so edges (which may include the
-        // table color just outside a rotated receipt) don't pollute the mean.
         val insetX = w * 0.1; val insetY = h * 0.1
-        val roiX = (minX + insetX).toInt().coerceIn(0, full.cols() - 1)
-        val roiY = (minY + insetY).toInt().coerceIn(0, full.rows() - 1)
-        val roiW = (w - 2 * insetX).toInt().coerceAtLeast(30)
-            .coerceAtMost(full.cols() - roiX)
-        val roiH = (h - 2 * insetY).toInt().coerceAtLeast(30)
-            .coerceAtMost(full.rows() - roiY)
-
-        if (roiW < 30 || roiH < 30) return false
+        val roiX = (minX + insetX).toInt()
+        val roiY = (minY + insetY).toInt()
+        val roiW = (w - 2 * insetX).toInt().coerceAtLeast(20)
+            .coerceAtMost(full.cols() - roiX - 1)
+        val roiH = (h - 2 * insetY).toInt().coerceAtLeast(20)
+            .coerceAtMost(full.rows() - roiY - 1)
+        if (roiW < 20 || roiH < 20) return false
 
         val lumas = mutableListOf<Double>()
         val chromas = mutableListOf<Double>()
-        val patch = 20
+        val patch = 24
         for (row in 0..2) for (col in 0..2) {
-            val px = roiX + (col + 1) * roiW / 4 - patch / 2
-            val py = roiY + (row + 1) * roiH / 4 - patch / 2
-            val pxC = px.coerceIn(0, full.cols() - patch - 1)
-            val pyC = py.coerceIn(0, full.rows() - patch - 1)
-            val sample = full.submat(Rect(pxC, pyC, patch, patch))
+            val px = (roiX + (col + 1) * roiW / 4 - patch / 2).coerceIn(0, full.cols() - patch - 1)
+            val py = (roiY + (row + 1) * roiH / 4 - patch / 2).coerceIn(0, full.rows() - patch - 1)
+            val sample = full.submat(Rect(px, py, patch, patch))
             val mean = Core.mean(sample)
             val r = mean.`val`[0]; val g = mean.`val`[1]; val b = mean.`val`[2]
             lumas += 0.299 * r + 0.587 * g + 0.114 * b
-            chromas += maxOf(r, g, b) - minOf(r, g, b)
+            chromas += max(r, max(g, b)) - min(r, min(g, b))
             sample.release()
         }
         lumas.sort(); chromas.sort()
-        val medianLuma = lumas[4]
-        val medianChroma = chromas[4]
-        val ok = medianLuma >= MIN_WHITE_LUMA && medianChroma <= MAX_WHITE_CHROMA
-        if (!ok) Log.v(TAG, "Rejected quad: luma=$medianLuma chroma=$medianChroma")
+        val ok = lumas[4] >= MIN_WHITE_LUMA && chromas[4] <= MAX_WHITE_CHROMA
+        if (!ok) Log.v(TAG, "Rejected quad interior: luma=${lumas[4]} chroma=${chromas[4]}")
         return ok
     }
 
-    private fun isFullFrame(corners: List<Point>, imgW: Int, imgH: Int): Boolean {
-        val minX = corners.minOf { it.x }
-        val maxX = corners.maxOf { it.x }
-        val minY = corners.minOf { it.y }
-        val maxY = corners.maxOf { it.y }
-        return minX < FRAME_MARGIN_PX &&
-            minY < FRAME_MARGIN_PX &&
-            maxX > imgW - FRAME_MARGIN_PX &&
-            maxY > imgH - FRAME_MARGIN_PX
-    }
+    // --- warp ---------------------------------------------------------------
 
-    private fun readingOrder(): Comparator<Quad> = Comparator { a, b ->
-        val ay = a.corners.minOf { it.y }
-        val by = b.corners.minOf { it.y }
-        val rowTol = 200.0
-        if (kotlin.math.abs(ay - by) > rowTol) ay.compareTo(by)
-        else a.corners.minOf { it.x }.compareTo(b.corners.minOf { it.x })
-    }
-
-    private fun warpDocument(full: Mat, corners: List<Point>): Bitmap {
+    private fun warpDocument(full: Mat, corners: List<CvPoint>): Bitmap {
         val src = MatOfPoint2f(*corners.toTypedArray())
 
         val widthTop = distance(corners[0], corners[1])
@@ -279,14 +542,14 @@ object DocumentDetector {
         val heightLeft = distance(corners[0], corners[3])
         val heightRight = distance(corners[1], corners[2])
 
-        val outW = maxOf(widthTop, widthBottom).toInt().coerceAtLeast(64)
-        val outH = maxOf(heightLeft, heightRight).toInt().coerceAtLeast(64)
+        val outW = max(widthTop, widthBottom).toInt().coerceAtLeast(64)
+        val outH = max(heightLeft, heightRight).toInt().coerceAtLeast(64)
 
         val dst = MatOfPoint2f(
-            Point(0.0, 0.0),
-            Point((outW - 1).toDouble(), 0.0),
-            Point((outW - 1).toDouble(), (outH - 1).toDouble()),
-            Point(0.0, (outH - 1).toDouble()),
+            CvPoint(0.0, 0.0),
+            CvPoint((outW - 1).toDouble(), 0.0),
+            CvPoint((outW - 1).toDouble(), (outH - 1).toDouble()),
+            CvPoint(0.0, (outH - 1).toDouble()),
         )
 
         val transform = Imgproc.getPerspectiveTransform(src, dst)
@@ -318,64 +581,43 @@ object DocumentDetector {
         return out
     }
 
-    private fun scaleToWorking(full: Mat, outWork: Mat): Double {
-        val maxSide = maxOf(full.cols(), full.rows())
-        if (maxSide <= WORK_MAX_SIDE) {
-            full.copyTo(outWork)
-            return 1.0
-        }
-        val scale = WORK_MAX_SIDE.toDouble() / maxSide
-        Imgproc.resize(full, outWork, Size(), scale, scale, Imgproc.INTER_AREA)
-        return scale
-    }
+    // --- geometry helpers ---------------------------------------------------
 
-    private fun distance(a: Point, b: Point): Double {
+    private fun distance(a: CvPoint, b: CvPoint): Double {
         val dx = a.x - b.x; val dy = a.y - b.y
-        return kotlin.math.sqrt(dx * dx + dy * dy)
+        return sqrt(dx * dx + dy * dy)
     }
 
-    private fun orderCorners(pts: Array<Point>): List<Point> {
-        val bySum = pts.sortedBy { it.x + it.y }
-        val byDiag = pts.sortedBy { it.x - it.y }
-        return listOf(bySum.first(), byDiag.last(), bySum.last(), byDiag.first())
+    /** Unsigned angular distance on a line (so 179° and 1° are 2° apart,
+     *  not 178° — text reads the same way upside down). */
+    private fun angleDistance(a: Double, b: Double): Double {
+        var d = abs(a - b)
+        while (d > PI) d -= PI
+        return min(d, PI - d)
     }
 
-    private fun isPlausibleQuad(pts: Array<Point>): Boolean {
-        if (pts.size != 4) return false
-        val ordered = orderCorners(pts)
-        val w = (distance(ordered[0], ordered[1]) + distance(ordered[3], ordered[2])) / 2.0
-        val h = (distance(ordered[0], ordered[3]) + distance(ordered[1], ordered[2])) / 2.0
-        if (w < 40 || h < 40) return false
-        val aspect = maxOf(w, h) / minOf(w, h)
-        return aspect in 1.0..12.0
+    private fun averageAngle(a: Double, b: Double): Double {
+        // Small-diff mean; handles wrap by using sin/cos averaging on 2θ,
+        // which canonicalizes ±π to the same orientation.
+        val sinSum = sin(2 * a) + sin(2 * b)
+        val cosSum = cos(2 * a) + cos(2 * b)
+        return atan2(sinSum, cosSum) / 2.0
     }
 
-    private fun deduplicate(input: List<Quad>): List<Quad> {
-        val sorted = input.sortedByDescending {
-            val w = it.boundsWidth(); val h = it.boundsHeight(); w * h
-        }
-        val kept = mutableListOf<Quad>()
-        for (d in sorted) {
-            val r = boundingRect(d.corners)
-            val overlaps = kept.any { iou(r, boundingRect(it.corners)) > 0.3 }
-            if (!overlaps) kept += d
-        }
-        return kept
+    private fun perpDistance(p1: CvPoint, p2: CvPoint, angleRad: Double): Double {
+        val dx = p1.x - p2.x; val dy = p1.y - p2.y
+        return abs(dx * -sin(angleRad) + dy * cos(angleRad))
     }
 
-    private fun boundingRect(pts: List<Point>): Rect {
-        val xs = pts.map { it.x }; val ys = pts.map { it.y }
-        val minX = xs.min(); val maxX = xs.max(); val minY = ys.min(); val maxY = ys.max()
-        return Rect(minX.toInt(), minY.toInt(), (maxX - minX).toInt(), (maxY - minY).toInt())
+    private fun alongDistance(p1: CvPoint, p2: CvPoint, angleRad: Double): Double {
+        val dx = p1.x - p2.x; val dy = p1.y - p2.y
+        return abs(dx * cos(angleRad) + dy * sin(angleRad))
     }
 
-    private fun iou(a: Rect, b: Rect): Double {
-        val xA = maxOf(a.x, b.x)
-        val yA = maxOf(a.y, b.y)
-        val xB = minOf(a.x + a.width, b.x + b.width)
-        val yB = minOf(a.y + a.height, b.y + b.height)
-        val inter = maxOf(0, xB - xA).toLong() * maxOf(0, yB - yA).toLong()
-        val union = a.width.toLong() * a.height + b.width.toLong() * b.height - inter
-        return if (union <= 0) 0.0 else inter.toDouble() / union
+    private fun median(values: List<Double>): Double {
+        val s = values.sorted()
+        return if (s.isEmpty()) 0.0
+        else if (s.size % 2 == 1) s[s.size / 2]
+        else (s[s.size / 2 - 1] + s[s.size / 2]) / 2.0
     }
 }

@@ -97,7 +97,9 @@ private fun Root(viewModel: MainViewModel) {
                     statusText = state.error ?: state.status,
                     busy = state.busy,
                     onCancel = viewModel::cancelReview,
+                    onRemoveQuad = viewModel::removeQuad,
                     onTapEmpty = viewModel::addQuadFromSeed,
+                    onDragCorner = viewModel::updateCorner,
                     onConfirm = viewModel::commitReview,
                 )
             } else when (tab) {

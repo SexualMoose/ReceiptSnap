@@ -62,10 +62,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
             _state.value = _state.value.copy(status = "Detecting documents…")
             val quads = withContext(Dispatchers.Default) {
-                runCatching { DocumentDetector.detect(photo) }
-                    .onFailure { Log.e(TAG, "Detection failed", it) }
-                    .getOrElse { emptyList() }
+                try {
+                    DocumentDetector.detect(photo)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Detection failed", t)
+                    emptyList()
+                }
             }
+
+            val stats = DocumentDetector.lastStats
+            val diag = "OCR: ${stats.textLines} lines · ${stats.clusters} clusters " +
+                "· ${stats.fromText} from text · ${stats.fromEdges} from edges"
+            Log.i(TAG, diag)
 
             _state.value = _state.value.copy(
                 phase = Phase.Review(
@@ -75,9 +83,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 ),
                 busy = false,
                 status = if (quads.isEmpty())
-                    "No receipts found. Tap to add one."
+                    "No receipts found. $diag. Tap to add one."
                 else
-                    "${quads.size} found. Tap to toggle, or tap empty area to add.",
+                    "Found ${quads.size}. $diag",
             )
         }
     }
@@ -92,9 +100,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val phase = _state.value.phase as? Phase.Review ?: return
         viewModelScope.launch {
             val grown = withContext(Dispatchers.Default) {
-                runCatching {
+                try {
                     DocumentDetector.growFromSeed(phase.bitmap, seedX, seedY, phase.nextQuadId)
-                }.onFailure { Log.w(TAG, "growFromSeed failed", it) }.getOrNull()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "growFromSeed failed", t)
+                    null
+                }
             }
             val quad = grown ?: defaultQuadAt(phase.bitmap, seedX, seedY, phase.nextQuadId)
 
@@ -130,17 +141,45 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /** Remove a quad the user decided wasn't a receipt. */
+    fun removeQuad(id: Long) {
+        _state.update { current ->
+            val p = current.phase as? Phase.Review ?: return@update current
+            current.copy(phase = p.copy(quads = p.quads.filterNot { it.id == id }))
+        }
+    }
+
+    /**
+     * Update one corner of a quad during manual resize. Accepts the new
+     * position; the caller (ReviewScreen) is responsible for clamping it
+     * to image bounds and checking convexity. If the resulting quad would
+     * be non-convex, the drag-end handler in the UI rolls it back.
+     */
+    fun updateCorner(id: Long, cornerIdx: Int, newPoint: CvPoint) {
+        _state.update { current ->
+            val p = current.phase as? Phase.Review ?: return@update current
+            val updated = p.quads.map { q ->
+                if (q.id != id) q
+                else q.copy(corners = q.corners.toMutableList().also { it[cornerIdx] = newPoint })
+            }
+            current.copy(phase = p.copy(quads = updated))
+        }
+    }
+
     fun cancelReview() {
         val current = _state.value.phase
         if (current is Phase.Review) current.bitmap.recycle()
         _state.value = UiState(phase = Phase.Camera)
     }
 
-    fun commitReview(selected: List<DocumentDetector.Quad>) {
+    /** Commit every quad currently in the review list. Removed quads are
+     *  already gone by the time this runs. */
+    fun commitReview() {
         val phase = _state.value.phase
         if (phase !is Phase.Review || _state.value.busy) return
-        if (selected.isEmpty()) {
-            _state.value = _state.value.copy(error = "Select at least one region.")
+        val toSave = phase.quads
+        if (toSave.isEmpty()) {
+            _state.value = _state.value.copy(error = "Add or keep at least one region.")
             return
         }
 
@@ -148,9 +187,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = _state.value.copy(busy = true, error = null)
 
             val saved = mutableListOf<SavedReceipt>()
-            selected.forEachIndexed { index, quad ->
+            toSave.forEachIndexed { index, quad ->
                 _state.value = _state.value.copy(
-                    status = "Processing ${index + 1} of ${selected.size}…",
+                    status = "Processing ${index + 1} of ${toSave.size}…",
                 )
                 val cropped = withContext(Dispatchers.Default) {
                     runCatching { DocumentDetector.warp(phase.bitmap, quad) }
@@ -179,7 +218,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
             _state.value = UiState(
                 phase = Phase.Camera,
-                status = "Saved ${saved.size} of ${selected.size}",
+                status = "Saved ${saved.size} of ${toSave.size}",
                 lastSaved = saved,
             )
         }

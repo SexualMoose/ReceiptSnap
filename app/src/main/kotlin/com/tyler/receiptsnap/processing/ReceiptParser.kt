@@ -50,7 +50,7 @@ object ReceiptParser {
 
     // --- meal detection -----------------------------------------------------
 
-    private val MEAL_KEYWORDS = listOf("restaurant", "tip", "gratuity")
+    private val MEAL_KEYWORDS = listOf("restaurant", "tip", "gratuity", "meal")
 
     private fun detectMeal(text: String): Boolean {
         val lower = text.lowercase(Locale.US)
@@ -84,16 +84,21 @@ object ReceiptParser {
         "jul" to 7, "aug" to 8, "sep" to 9, "sept" to 9, "oct" to 10, "nov" to 11, "dec" to 12,
     )
 
-    fun detectDateInText(text: String): LocalDate? {
+    fun detectDateInText(text: String): LocalDate? = allDatesInText(text).firstOrNull()
+
+    /** Returns *every* plausible date match in `text`, deduplicated. Used by
+     *  the receipt validity test so we can enforce "exactly one date". */
+    fun allDatesInText(text: String): List<LocalDate> {
         val lines = text.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+        val out = linkedSetOf<LocalDate>()
         for (line in lines) {
             for (pattern in DATE_PATTERNS) {
                 val m = pattern.regex.find(line) ?: continue
                 val parsed = parseMatch(pattern, m) ?: continue
-                if (parsed.year in 1990..2099) return parsed
+                if (parsed.year in 1990..2099) out += parsed
             }
         }
-        return null
+        return out.toList()
     }
 
     private fun parseMatch(pattern: DatePattern, m: MatchResult): LocalDate? {
