@@ -72,15 +72,20 @@ import com.tyler.receiptsnap.processing.CoupaUploadsFolder
 import com.tyler.receiptsnap.processing.PdfMaker
 import com.tyler.receiptsnap.processing.SmtpSender
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
-/** Number of SMTP sends the library will run concurrently. Stays well under
- *  both Gmail (~10) and Office 365 (~20) per-account connection limits. */
+/** Concurrent SMTP workers. Each keeps one authenticated connection open
+ *  for its share of the queue — so this also equals the number of auth
+ *  attempts we make per batch. Stays well under Gmail/Office 365 limits. */
 private const val MAX_PARALLEL_SENDS = 4
+
+/** Milliseconds between worker cold-starts. Prevents N simultaneous login
+ *  attempts which can trigger anti-abuse throttling on Office 365. */
+private const val AUTH_STAGGER_MS = 250L
 
 data class LibraryItem(
     val uri: Uri,
@@ -146,16 +151,15 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     }
 
     /**
-     * Process the send queue in parallel: [MAX_PARALLEL_SENDS] workers each
-     * pull receipts off the queue, PDF them, and fire them at Coupa's SMTP
-     * endpoint. Keeps the per-item overhead low (each worker reuses its
-     * coroutine for its share of items) while avoiding rate-limit
-     * trouble — Gmail and Office 365 both tolerate ~10 concurrent SMTP
-     * submissions per account, and 4 is comfortably under that.
+     * Process the send queue with a small pool of persistent-connection
+     * SMTP workers. Each of [MAX_PARALLEL_SENDS] workers authenticates
+     * ONCE against the SMTP server and then pipelines every message it
+     * handles through the same connection. This avoids the "545 too many
+     * login attempts" rejection we'd hit if we re-authenticated for every
+     * receipt — 20 receipts now mean 4 auths, not 20.
      *
-     * On any send failure we record the first error and let in-flight
-     * workers finish; the queue halts so the user doesn't get a cascade
-     * of identical auth-rejection attempts (almost always the culprit).
+     * Workers are staggered by a short delay at startup so the server
+     * doesn't see four simultaneous login requests from one account.
      */
     fun runSendLoop() {
         if (sendInFlight) return
@@ -176,59 +180,79 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                 )
 
                 val queueSnapshot = sendQueue
-                val semaphore = Semaphore(MAX_PARALLEL_SENDS)
                 val errorRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-                coroutineScope {
-                    queueSnapshot.forEach { item ->
-                        launch(Dispatchers.IO) {
-                            if (errorRef.get() != null) return@launch
-                            semaphore.withPermit {
-                                if (errorRef.get() != null) return@withPermit
-                                val baseName = item.name
-                                    .removeSuffix(".jpg")
-                                    .removeSuffix(".jpeg")
-                                    .removeSuffix(".png")
-                                    .removeSuffix(".webp")
-                                val result = try {
-                                    val pdf = PdfMaker.makePdf(
-                                        context = context,
-                                        imageUri = item.uri,
-                                        outputDir = PdfMaker.outputDir(context),
-                                        baseName = baseName,
-                                    )
-                                    SmtpSender.send(
-                                        config = config,
-                                        toEmail = recipient,
-                                        subject = baseName,
-                                        bodyText = "Receipt attached (sent from ReceiptSnap).",
-                                        attachment = pdf,
-                                    )
-                                } catch (t: Throwable) {
-                                    SmtpSender.SendResult.Failure(
-                                        "Prepare failed: ${t.message}", t,
-                                    )
-                                }
+                // Feed the queue into a channel so each worker pulls its
+                // own share whenever it's ready. Channel size = queue size
+                // so offer() never blocks.
+                val channel = Channel<LibraryItem>(capacity = queueSnapshot.size.coerceAtLeast(1))
+                queueSnapshot.forEach { channel.trySend(it) }
+                channel.close()
 
-                                when (result) {
-                                    is SmtpSender.SendResult.Success -> {
-                                        sentTracker.markSent(item.uri)
-                                        if (item.moveAfterSend) {
-                                            // Fire and forget — archive failure
-                                            // shouldn't block the send report.
-                                            runCatching {
-                                                CoupaUploadsFolder.moveToArchive(
-                                                    context, item.uri, item.name,
-                                                )
+                val workerCount = minOf(MAX_PARALLEL_SENDS, queueSnapshot.size).coerceAtLeast(1)
+                coroutineScope {
+                    repeat(workerCount) { workerIdx ->
+                        launch(Dispatchers.IO) {
+                            // Stagger cold starts so the server doesn't see
+                            // workerCount simultaneous auth requests.
+                            delay(workerIdx * AUTH_STAGGER_MS)
+                            if (errorRef.get() != null) return@launch
+
+                            val connection = try {
+                                SmtpSender.openConnection(config)
+                            } catch (t: Throwable) {
+                                errorRef.compareAndSet(
+                                    null,
+                                    "Worker $workerIdx couldn't open SMTP: ${t.message ?: "connect failed"}",
+                                )
+                                return@launch
+                            }
+
+                            connection.use { conn ->
+                                for (item in channel) {
+                                    if (errorRef.get() != null) break
+                                    val baseName = item.name
+                                        .removeSuffix(".jpg")
+                                        .removeSuffix(".jpeg")
+                                        .removeSuffix(".png")
+                                        .removeSuffix(".webp")
+                                    val result = try {
+                                        val pdf = PdfMaker.makePdf(
+                                            context = context,
+                                            imageUri = item.uri,
+                                            outputDir = PdfMaker.outputDir(context),
+                                            baseName = baseName,
+                                        )
+                                        conn.send(
+                                            toEmail = recipient,
+                                            subject = baseName,
+                                            bodyText = "Receipt attached (sent from ReceiptSnap).",
+                                            attachment = pdf,
+                                        )
+                                    } catch (t: Throwable) {
+                                        SmtpSender.SendResult.Failure(
+                                            "Prepare failed: ${t.message}", t,
+                                        )
+                                    }
+
+                                    when (result) {
+                                        is SmtpSender.SendResult.Success -> {
+                                            sentTracker.markSent(item.uri)
+                                            if (item.moveAfterSend) {
+                                                runCatching {
+                                                    CoupaUploadsFolder.moveToArchive(
+                                                        context, item.uri, item.name,
+                                                    )
+                                                }
+                                            }
+                                            withContext(Dispatchers.Main) {
+                                                sendQueue = sendQueue - item
+                                                sentCount += 1
                                             }
                                         }
-                                        withContext(Dispatchers.Main) {
-                                            sendQueue = sendQueue - item
-                                            sentCount += 1
+                                        is SmtpSender.SendResult.Failure -> {
+                                            errorRef.compareAndSet(null, result.message)
                                         }
-                                    }
-                                    is SmtpSender.SendResult.Failure -> {
-                                        errorRef.compareAndSet(null, result.message)
                                     }
                                 }
                             }
