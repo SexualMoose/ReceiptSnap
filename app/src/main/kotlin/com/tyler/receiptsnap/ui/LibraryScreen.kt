@@ -68,16 +68,28 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.tyler.receiptsnap.ReceiptSnapApp
+import com.tyler.receiptsnap.processing.CoupaUploadsFolder
 import com.tyler.receiptsnap.processing.PdfMaker
 import com.tyler.receiptsnap.processing.SmtpSender
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+
+/** Number of SMTP sends the library will run concurrently. Stays well under
+ *  both Gmail (~10) and Office 365 (~20) per-account connection limits. */
+private const val MAX_PARALLEL_SENDS = 4
 
 data class LibraryItem(
     val uri: Uri,
     val name: String,
     val dateAddedSec: Long,
+    /** When true, the item was picked via the external-folder upload flow;
+     *  after a successful send we move it into Pictures/Coupa Uploads so
+     *  the user's inbox folder stays clean. */
+    val moveAfterSend: Boolean = false,
 )
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -134,59 +146,100 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     }
 
     /**
-     * Process the send queue automatically: build a PDF for each selected
-     * receipt and push it to Coupa via SMTP, with no email-client detour.
-     * Runs until the queue is empty or an SMTP error occurs.
+     * Process the send queue in parallel: [MAX_PARALLEL_SENDS] workers each
+     * pull receipts off the queue, PDF them, and fire them at Coupa's SMTP
+     * endpoint. Keeps the per-item overhead low (each worker reuses its
+     * coroutine for its share of items) while avoiding rate-limit
+     * trouble — Gmail and Office 365 both tolerate ~10 concurrent SMTP
+     * submissions per account, and 4 is comfortably under that.
+     *
+     * On any send failure we record the first error and let in-flight
+     * workers finish; the queue halts so the user doesn't get a cascade
+     * of identical auth-rejection attempts (almost always the culprit).
      */
     fun runSendLoop() {
         if (sendInFlight) return
         scope.launch {
             sendInFlight = true
             try {
-                while (sendQueue.isNotEmpty()) {
-                    val next = sendQueue.first()
-                    val recipient = settings.currentWalletEmail()
-                    if (recipient.isBlank()) {
-                        sendError = "Set Coupa host and email in Settings first."
-                        sendQueue = emptyList()
-                        return@launch
-                    }
-                    val config = SmtpSender.Config(
-                        host = settings.smtpHost.value,
-                        port = settings.smtpPort.value,
-                        fromEmail = settings.currentSenderEmail(),
-                        password = settings.smtpPassword.value,
-                    )
-                    val result = withContext(Dispatchers.IO) {
-                        val pdf = PdfMaker.makePdf(
-                            context = context,
-                            imageUri = next.uri,
-                            outputDir = PdfMaker.outputDir(context),
-                            baseName = next.name.removeSuffix(".jpg"),
-                        )
-                        SmtpSender.send(
-                            config = config,
-                            toEmail = recipient,
-                            subject = next.name.removeSuffix(".jpg"),
-                            bodyText = "Receipt attached (sent from ReceiptSnap).",
-                            attachment = pdf,
-                        )
-                    }
-                    when (result) {
-                        is SmtpSender.SendResult.Success -> {
-                            sentTracker.markSent(next.uri)
-                            sendQueue = sendQueue.drop(1)
-                            sentCount += 1
-                        }
-                        is SmtpSender.SendResult.Failure -> {
-                            sendError = result.message
-                            // Stop the queue — the same error will almost
-                            // certainly recur on the next item.
-                            return@launch
+                val recipient = settings.currentWalletEmail()
+                if (recipient.isBlank()) {
+                    sendError = "Set Coupa host and email in Settings first."
+                    sendQueue = emptyList()
+                    return@launch
+                }
+                val config = SmtpSender.Config(
+                    host = settings.smtpHost.value,
+                    port = settings.smtpPort.value,
+                    fromEmail = settings.currentSenderEmail(),
+                    password = settings.smtpPassword.value,
+                )
+
+                val queueSnapshot = sendQueue
+                val semaphore = Semaphore(MAX_PARALLEL_SENDS)
+                val errorRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+                coroutineScope {
+                    queueSnapshot.forEach { item ->
+                        launch(Dispatchers.IO) {
+                            if (errorRef.get() != null) return@launch
+                            semaphore.withPermit {
+                                if (errorRef.get() != null) return@withPermit
+                                val baseName = item.name
+                                    .removeSuffix(".jpg")
+                                    .removeSuffix(".jpeg")
+                                    .removeSuffix(".png")
+                                    .removeSuffix(".webp")
+                                val result = try {
+                                    val pdf = PdfMaker.makePdf(
+                                        context = context,
+                                        imageUri = item.uri,
+                                        outputDir = PdfMaker.outputDir(context),
+                                        baseName = baseName,
+                                    )
+                                    SmtpSender.send(
+                                        config = config,
+                                        toEmail = recipient,
+                                        subject = baseName,
+                                        bodyText = "Receipt attached (sent from ReceiptSnap).",
+                                        attachment = pdf,
+                                    )
+                                } catch (t: Throwable) {
+                                    SmtpSender.SendResult.Failure(
+                                        "Prepare failed: ${t.message}", t,
+                                    )
+                                }
+
+                                when (result) {
+                                    is SmtpSender.SendResult.Success -> {
+                                        sentTracker.markSent(item.uri)
+                                        if (item.moveAfterSend) {
+                                            // Fire and forget — archive failure
+                                            // shouldn't block the send report.
+                                            runCatching {
+                                                CoupaUploadsFolder.moveToArchive(
+                                                    context, item.uri, item.name,
+                                                )
+                                            }
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            sendQueue = sendQueue - item
+                                            sentCount += 1
+                                        }
+                                    }
+                                    is SmtpSender.SendResult.Failure -> {
+                                        errorRef.compareAndSet(null, result.message)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                if (sentCount > 0) {
+
+                val err = errorRef.get()
+                if (err != null) {
+                    sendError = err
+                } else if (sentCount > 0) {
                     Toast.makeText(
                         context,
                         "Sent $sentCount receipt${if (sentCount == 1) "" else "s"} to Coupa.",
@@ -219,12 +272,14 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
         if (treeUri == null) return@rememberLauncherForActivityResult
-        // Persist read access for this tree across process restarts so a
-        // resumed queue keeps working.
+        // Persist R/W access for this tree across process restarts so a
+        // resumed queue keeps working. WRITE is required for the "move
+        // successful uploads into Pictures/Coupa Uploads" archive step.
         runCatching {
             context.contentResolver.takePersistableUriPermission(
                 treeUri,
-                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
             )
         }
         val root = DocumentFile.fromTreeUri(context, treeUri) ?: return@rememberLauncherForActivityResult
@@ -237,7 +292,12 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         }
         val now = System.currentTimeMillis() / 1000
         sendQueue = imageFiles.map { f ->
-            LibraryItem(uri = f.uri, name = f.name ?: "receipt.jpg", dateAddedSec = now)
+            LibraryItem(
+                uri = f.uri,
+                name = f.name ?: "receipt.jpg",
+                dateAddedSec = now,
+                moveAfterSend = true,
+            )
         }
         sentCount = 0
         sendError = null
