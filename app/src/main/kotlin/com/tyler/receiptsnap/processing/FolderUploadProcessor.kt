@@ -31,6 +31,10 @@ object FolderUploadProcessor {
     data class ProcessedCrop(
         val tempFile: File,
         val displayName: String,  // e.g. "2026-04-23_London_meal.jpg"
+        /** Parsed receipt metadata. Date is what the sort-by-month flow
+         *  uses to bucket crops into yyyy-MM folders; null means the OCR
+         *  pass didn't find a date. */
+        val info: ReceiptParser.Info,
     )
 
     sealed interface Result {
@@ -80,7 +84,11 @@ object FolderUploadProcessor {
                     }
                 }
                 warped.recycle()
-                crops += ProcessedCrop(tempFile = tmpFile, displayName = "$uniqueName.jpg")
+                crops += ProcessedCrop(
+                    tempFile = tmpFile,
+                    displayName = "$uniqueName.jpg",
+                    info = info,
+                )
             }
 
             if (crops.isEmpty()) Result.NoReceipts

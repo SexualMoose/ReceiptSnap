@@ -71,6 +71,7 @@ import com.tyler.receiptsnap.ReceiptSnapApp
 import com.tyler.receiptsnap.processing.CoupaUploadsFolder
 import com.tyler.receiptsnap.processing.FolderUploadProcessor
 import com.tyler.receiptsnap.processing.PdfMaker
+import com.tyler.receiptsnap.processing.ReceiptsSortedFolder
 import com.tyler.receiptsnap.processing.SmtpSender
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -80,6 +81,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+
+/** What the user picked in the Upload-folder chooser dialog. The folder
+ *  launcher branches on this after the SAF tree picker returns. */
+private enum class FolderAction { CoupaUpload, SortByMonth }
 
 private sealed interface PassOutcome {
     /** Every item in the queue that this pass started with was sent. */
@@ -321,6 +326,12 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     var preprocessTotal by remember { mutableIntStateOf(0) }
     var preprocessLabel by remember { mutableStateOf<String?>(null) }
 
+    // "Upload folder" opens a chooser dialog first — user picks whether
+    // the selected folder should be processed + sent to Coupa, or
+    // processed + sorted into Pictures/Receipts Sorted/yyyy-MM/ folders.
+    var showUploadChooser by remember { mutableStateOf(false) }
+    var pendingFolderAction by remember { mutableStateOf(FolderAction.CoupaUpload) }
+
     // Android 11+ returns a pending intent for scoped-storage deletes that
     // need user confirmation (anything written by another app). Since we
     // wrote these files, the first tap usually succeeds, but we still
@@ -501,6 +512,107 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         sendError = null
         selected = emptySet()
 
+        if (pendingFolderAction == FolderAction.SortByMonth) {
+            // Branch 3 — process and sort into Pictures/Receipts Sorted/yyyy-MM/.
+            // Runs the same DocumentDetector + ReceiptParser pipeline as the
+            // Coupa upload path but saves each detected crop into a month-
+            // named folder instead of queuing for email. No SMTP involvement.
+            scope.launch {
+                withContext(Dispatchers.IO) {
+                    FolderUploadProcessor.cropsDir(context).listFiles()?.forEach {
+                        runCatching { it.delete() }
+                    }
+                }
+                preprocessTotal = imageFiles.size
+                preprocessDone = 0
+                preprocessLabel = "Sorting receipts"
+
+                val savedCount = java.util.concurrent.atomic.AtomicInteger(0)
+                val undatedCount = java.util.concurrent.atomic.AtomicInteger(0)
+                val doneCounter = java.util.concurrent.atomic.AtomicInteger(0)
+                val semaphore = Semaphore(MAX_PARALLEL_PREPROCESS)
+                val successfulSources =
+                    java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+                val failedSources =
+                    java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+
+                coroutineScope {
+                    imageFiles.forEach { file ->
+                        launch(Dispatchers.Default) {
+                            semaphore.withPermit {
+                                val srcUri = file.uri
+                                val srcName = file.name ?: "receipt.jpg"
+                                val result = FolderUploadProcessor.process(context, srcUri)
+                                when (result) {
+                                    is FolderUploadProcessor.Result.Detected -> {
+                                        var allOk = true
+                                        for (crop in result.crops) {
+                                            val dest = withContext(Dispatchers.IO) {
+                                                ReceiptsSortedFolder.saveToMonthFolder(
+                                                    context = context,
+                                                    tempFile = crop.tempFile,
+                                                    date = crop.info.date,
+                                                    displayName = crop.displayName,
+                                                )
+                                            }
+                                            if (dest != null) {
+                                                savedCount.incrementAndGet()
+                                                if (crop.info.date == null) {
+                                                    undatedCount.incrementAndGet()
+                                                }
+                                                runCatching { crop.tempFile.delete() }
+                                            } else {
+                                                allOk = false
+                                            }
+                                        }
+                                        if (allOk) successfulSources.add(srcUri to srcName)
+                                        else failedSources.add(srcUri to srcName)
+                                    }
+                                    is FolderUploadProcessor.Result.NoReceipts,
+                                    is FolderUploadProcessor.Result.LoadFailed -> {
+                                        withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                CoupaUploadsFolder.moveToFailed(
+                                                    context, srcUri, srcName,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                val n = doneCounter.incrementAndGet()
+                                withContext(Dispatchers.Main) {
+                                    preprocessDone = n
+                                    preprocessLabel = "Sorting $n of ${imageFiles.size}"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Archive sources whose crops ALL landed in month folders
+                // (same convention as the Coupa-upload flow).
+                withContext(Dispatchers.IO) {
+                    for ((srcUri, srcName) in successfulSources - failedSources) {
+                        runCatching { CoupaUploadsFolder.moveToArchive(context, srcUri, srcName) }
+                    }
+                }
+
+                preprocessTotal = 0
+                preprocessDone = 0
+                preprocessLabel = null
+
+                val saved = savedCount.get()
+                val undated = undatedCount.get()
+                val msg = buildString {
+                    append("Sorted $saved receipt${if (saved == 1) "" else "s"} ")
+                    append("into Pictures/Receipts Sorted.")
+                    if (undated > 0) append(" $undated went to Undated/.")
+                }
+                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+            }
+            return@rememberLauncherForActivityResult
+        }
+
         if (isFailedFolder) {
             // Branch 1 — passthrough. One PDF per source, source bytes
             // embedded as-is. moveAfterSend routes to Pictures/Coupa Uploads.
@@ -631,6 +743,51 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         return
     }
 
+    if (showUploadChooser) {
+        AlertDialog(
+            onDismissRequest = { showUploadChooser = false },
+            title = { Text("Upload folder") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "What would you like to do with the images in that folder?",
+                        color = Color.White.copy(alpha = 0.85f),
+                    )
+                    Text(
+                        text = "• Send to Coupa — process each image, then email the " +
+                            "detected receipts.\n" +
+                            "• Sort by month — process each image and save the detected " +
+                            "receipts into Pictures/Receipts Sorted/yyyy-MM/. Nothing is emailed.",
+                        color = Color.White.copy(alpha = 0.55f),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(onClick = {
+                        showUploadChooser = false
+                        pendingFolderAction = FolderAction.CoupaUpload
+                        folderLauncher.launch(null)
+                    }) { Text("Process and send to Coupa", color = MaterialTheme.colorScheme.primary) }
+                    TextButton(onClick = {
+                        showUploadChooser = false
+                        pendingFolderAction = FolderAction.SortByMonth
+                        folderLauncher.launch(null)
+                    }) { Text("Process and sort by month", color = MaterialTheme.colorScheme.primary) }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUploadChooser = false }) {
+                    Text("Cancel", color = Color.White.copy(alpha = 0.8f))
+                }
+            },
+            containerColor = Color(0xFF141414),
+            titleContentColor = MaterialTheme.colorScheme.primary,
+            textContentColor = Color.White,
+        )
+    }
+
     if (confirmDelete) {
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
@@ -671,7 +828,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             },
             onDismissError = { sendError = null },
             onRequestDelete = { confirmDelete = true },
-            onUploadFolder = { folderLauncher.launch(null) },
+            onUploadFolder = { showUploadChooser = true },
         )
 
         if (items.isEmpty()) {
