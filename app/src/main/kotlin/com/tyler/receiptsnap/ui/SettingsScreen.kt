@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,6 +27,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -296,6 +300,41 @@ private fun AccountSwitcher(settings: com.tyler.receiptsnap.data.SettingsStore) 
                 style = MaterialTheme.typography.bodySmall,
             )
         }
+
+        // Auto-failover: when the current account replies with a rate/quota
+        // error mid-batch, automatically advance to the next saved account
+        // and continue instead of stopping.
+        val failover by settings.failoverEnabled.collectAsState()
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 6.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Auto-failover on limit errors",
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = "If the active account gets a rate/quota/too-many-logins " +
+                        "response, switch to the next saved account and keep sending.",
+                    color = Color.White.copy(alpha = 0.55f),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(
+                checked = failover,
+                onCheckedChange = settings::setFailoverEnabled,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color.Black,
+                    checkedTrackColor = MaterialTheme.colorScheme.primary,
+                    uncheckedThumbColor = Color.White.copy(alpha = 0.8f),
+                    uncheckedTrackColor = Color(0xFF2A2A2A),
+                ),
+            )
+        }
     }
 }
 
@@ -347,6 +386,11 @@ private fun DarkOutlinedField(
     keyboardType: KeyboardType = KeyboardType.Text,
     isPassword: Boolean = false,
 ) {
+    // Password field gets an eye-button toggle. State is local to the field
+    // so multiple password fields on one screen each show/hide independently.
+    var passwordVisible by remember { mutableStateOf(false) }
+    val showMasked = isPassword && !passwordVisible
+
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
@@ -354,10 +398,21 @@ private fun DarkOutlinedField(
         placeholder = { Text(placeholder, color = Color.White.copy(alpha = 0.35f)) },
         singleLine = true,
         modifier = Modifier.fillMaxWidth(),
-        visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
+        visualTransformation = if (showMasked) PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions = KeyboardOptions(
             keyboardType = if (isPassword) KeyboardType.Password else keyboardType,
         ),
+        trailingIcon = if (isPassword) {
+            {
+                androidx.compose.material3.IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    androidx.compose.material3.Icon(
+                        imageVector = if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (passwordVisible) "Hide password" else "Show password",
+                        tint = Color.White.copy(alpha = 0.7f),
+                    )
+                }
+            }
+        } else null,
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = Color.White,
             unfocusedTextColor = Color.White,

@@ -81,6 +81,181 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
+private sealed interface PassOutcome {
+    /** Every item in the queue that this pass started with was sent. */
+    data object AllSent : PassOutcome
+    /** Account hit a rate/quota/too-many-logins error. Remaining items
+     *  stay in the queue; caller may try the next account. */
+    data class LimitHit(val message: String) : PassOutcome
+    /** Something else failed (bad credentials, network down, bad config)
+     *  that switching accounts won't fix — stop. */
+    data class FatalError(val message: String) : PassOutcome
+}
+
+/** SMTP server error strings that indicate a rate/quota limit rather than
+ *  a bad config. When failover is enabled these are the signal to switch
+ *  accounts instead of stopping the whole batch. */
+private fun isLimitError(msg: String?): Boolean {
+    if (msg == null) return false
+    val lower = msg.lowercase()
+    return "545" in lower ||                   // too many login attempts (widely used)
+        "421" in lower ||                      // service not available / throttled
+        "450" in lower || "452" in lower ||    // mailbox busy / insufficient storage (temporary)
+        "too many" in lower ||
+        "rate limit" in lower ||
+        "daily" in lower ||
+        "quota" in lower ||
+        "limit exceeded" in lower ||
+        "5.4.5" in lower ||                    // Gmail daily-user limit
+        "5.1.1" in lower ||                    // user unknown — can also signal shutdown
+        "4.4.2" in lower ||
+        "4.7.1" in lower                       // temporary rate-limit code
+}
+
+/**
+ * Run one end-to-end pass of the queue against [account]. Workers each
+ * open their own persistent connection (to avoid per-message re-auth)
+ * and drain the shared channel. On any worker failure the pass short-
+ * circuits with either [PassOutcome.LimitHit] or
+ * [PassOutcome.FatalError] so the outer loop can decide whether to
+ * fail over.
+ */
+private suspend fun runSendPass(
+    account: com.tyler.receiptsnap.data.SmtpAccount,
+    recipient: String,
+    context: android.content.Context,
+    sentTracker: com.tyler.receiptsnap.data.SentTracker,
+    onSuccess: suspend (LibraryItem) -> Unit,
+    currentQueue: () -> List<LibraryItem>,
+): PassOutcome {
+    val queueSnapshot = currentQueue()
+    if (queueSnapshot.isEmpty()) return PassOutcome.AllSent
+
+    val config = SmtpSender.Config(
+        host = account.host,
+        port = account.port,
+        fromEmail = account.email,
+        password = account.password,
+    )
+
+    val limitRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    val fatalRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    val successfulSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+    val failedSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+
+    val channel = Channel<LibraryItem>(capacity = queueSnapshot.size.coerceAtLeast(1))
+    queueSnapshot.forEach { channel.trySend(it) }
+    channel.close()
+
+    val workerCount = minOf(MAX_PARALLEL_SENDS, queueSnapshot.size).coerceAtLeast(1)
+    coroutineScope {
+        repeat(workerCount) { workerIdx ->
+            launch(Dispatchers.IO) {
+                delay(workerIdx * AUTH_STAGGER_MS)
+                if (limitRef.get() != null || fatalRef.get() != null) return@launch
+
+                val connection = try {
+                    SmtpSender.openConnection(config)
+                } catch (t: Throwable) {
+                    val msg = t.message ?: "connect failed"
+                    if (isLimitError(msg)) limitRef.compareAndSet(null, msg)
+                    else fatalRef.compareAndSet(null, "Worker $workerIdx couldn't open SMTP: $msg")
+                    return@launch
+                }
+
+                connection.use { conn ->
+                    for (item in channel) {
+                        if (limitRef.get() != null || fatalRef.get() != null) break
+                        val baseName = item.name
+                            .removeSuffix(".jpg").removeSuffix(".jpeg")
+                            .removeSuffix(".png").removeSuffix(".webp")
+                        val result = try {
+                            val pdf = if (item.pdfPassthrough) {
+                                PdfMaker.makePdfPassthrough(
+                                    context = context,
+                                    imageUri = item.uri,
+                                    outputDir = PdfMaker.outputDir(context),
+                                    baseName = baseName,
+                                )
+                            } else {
+                                PdfMaker.makePdf(
+                                    context = context,
+                                    imageUri = item.uri,
+                                    outputDir = PdfMaker.outputDir(context),
+                                    baseName = baseName,
+                                    maxWidthPx = item.pdfMaxWidthPx ?: PdfMaker.DEFAULT_MAX_WIDTH_PX,
+                                )
+                            }
+                            conn.send(
+                                toEmail = recipient,
+                                subject = baseName,
+                                bodyText = "Receipt attached (sent from ReceiptSnap).",
+                                attachment = pdf,
+                            )
+                        } catch (t: Throwable) {
+                            SmtpSender.SendResult.Failure("Prepare failed: ${t.message}", t)
+                        }
+
+                        when (result) {
+                            is SmtpSender.SendResult.Success -> {
+                                sentTracker.markSent(item.uri)
+                                if (item.moveAfterSend) {
+                                    val srcUri = item.sourceUri
+                                    val srcName = item.sourceName
+                                    if (srcUri != null && srcName != null) {
+                                        successfulSources.add(srcUri to srcName)
+                                    } else {
+                                        runCatching {
+                                            CoupaUploadsFolder.moveToArchive(context, item.uri, item.name)
+                                        }
+                                    }
+                                }
+                                if (item.uri.scheme == "file") {
+                                    runCatching { java.io.File(item.uri.path!!).delete() }
+                                }
+                                onSuccess(item)
+                            }
+                            is SmtpSender.SendResult.Failure -> {
+                                val srcUri = item.sourceUri
+                                val srcName = item.sourceName
+                                if (srcUri != null && srcName != null) {
+                                    failedSources.add(srcUri to srcName)
+                                }
+                                // Classify: if it smells like a rate limit,
+                                // record as such so the outer loop can fail
+                                // over rather than marking the whole batch
+                                // fatal.
+                                if (isLimitError(result.message)) {
+                                    limitRef.compareAndSet(null, result.message)
+                                } else {
+                                    fatalRef.compareAndSet(null, result.message)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Archive sources whose crops all landed — even when we're returning
+    // LimitHit for the pass, successful crops still deserve their source
+    // moved since the failed ones can be retried against the next
+    // account on the next pass.
+    val sourcesToArchive = successfulSources - failedSources
+    withContext(Dispatchers.IO) {
+        for ((srcUri, srcName) in sourcesToArchive) {
+            runCatching { CoupaUploadsFolder.moveToArchive(context, srcUri, srcName) }
+        }
+    }
+
+    return when {
+        limitRef.get() != null -> PassOutcome.LimitHit(limitRef.get()!!)
+        fatalRef.get() != null -> PassOutcome.FatalError(fatalRef.get()!!)
+        else -> PassOutcome.AllSent
+    }
+}
+
 /** Concurrent SMTP workers. Each keeps one authenticated connection open
  *  for its share of the queue — so this also equals the number of auth
  *  attempts we make per batch. Stays well under Gmail (~10) and Office
@@ -179,15 +354,16 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     }
 
     /**
-     * Process the send queue with a small pool of persistent-connection
-     * SMTP workers. Each of [MAX_PARALLEL_SENDS] workers authenticates
-     * ONCE against the SMTP server and then pipelines every message it
-     * handles through the same connection. This avoids the "545 too many
-     * login attempts" rejection we'd hit if we re-authenticated for every
-     * receipt — 20 receipts now mean 4 auths, not 20.
+     * Process the send queue. Each saved SMTP account runs as a "pass" —
+     * all MAX_PARALLEL_SENDS workers open their connections against the
+     * current account and drain as much of the queue as they can.
+     * If the account replies with a rate/quota/too-many-logins error AND
+     * failover is enabled, we switch to the next saved account and
+     * continue. Successful items stay removed from the queue; the next
+     * account picks up where the prior one stopped.
      *
-     * Workers are staggered by a short delay at startup so the server
-     * doesn't see four simultaneous login requests from one account.
+     * Persistent connections keep auth cost per account at N (one per
+     * worker) instead of N × queue size.
      */
     fun runSendLoop() {
         if (sendInFlight) return
@@ -200,152 +376,72 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                     sendQueue = emptyList()
                     return@launch
                 }
-                val config = SmtpSender.Config(
-                    host = settings.smtpHost.value,
-                    port = settings.smtpPort.value,
-                    fromEmail = settings.currentSenderEmail(),
-                    password = settings.smtpPassword.value,
-                )
 
-                val queueSnapshot = sendQueue
-                val errorRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
-                // A single source image can yield multiple receipts (e.g.
-                // three receipts laid on one surface and captured in one
-                // external photo). Track successes and failures per
-                // source separately so archival is conservative: only
-                // move the source to Coupa Uploads when ALL its crops
-                // landed, never if any failed. Sources with mixed success
-                // stay in place so the user can fix the config and
-                // retry without losing the file.
-                val successfulSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
-                val failedSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+                val allAccounts = settings.accounts.value
+                if (allAccounts.isEmpty()) {
+                    sendError = "No SMTP accounts configured. Add one in Settings."
+                    sendQueue = emptyList()
+                    return@launch
+                }
 
-                // Feed the queue into a channel so each worker pulls its
-                // own share whenever it's ready. Channel size = queue size
-                // so offer() never blocks.
-                val channel = Channel<LibraryItem>(capacity = queueSnapshot.size.coerceAtLeast(1))
-                queueSnapshot.forEach { channel.trySend(it) }
-                channel.close()
+                // Accounts to attempt, in order. Active first, then others
+                // only when failover is on. With failover off, we just
+                // try the active account and stop on any error.
+                val activeId = settings.activeAccountId.value
+                val active = allAccounts.firstOrNull { it.id == activeId } ?: allAccounts.first()
+                val failover = settings.failoverEnabled.value
+                val accountOrder = buildList {
+                    add(active)
+                    if (failover) addAll(allAccounts.filter { it.id != active.id })
+                }
 
-                val workerCount = minOf(MAX_PARALLEL_SENDS, queueSnapshot.size).coerceAtLeast(1)
-                coroutineScope {
-                    repeat(workerCount) { workerIdx ->
-                        launch(Dispatchers.IO) {
-                            // Stagger cold starts so the server doesn't see
-                            // workerCount simultaneous auth requests.
-                            delay(workerIdx * AUTH_STAGGER_MS)
-                            if (errorRef.get() != null) return@launch
+                for ((accountIdx, account) in accountOrder.withIndex()) {
+                    if (sendQueue.isEmpty()) break
+                    if (account.id != settings.activeAccountId.value) {
+                        settings.setActiveAccount(account.id)
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                "Rate limit hit — switching to ${account.email}",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }
 
-                            val connection = try {
-                                SmtpSender.openConnection(config)
-                            } catch (t: Throwable) {
-                                errorRef.compareAndSet(
-                                    null,
-                                    "Worker $workerIdx couldn't open SMTP: ${t.message ?: "connect failed"}",
-                                )
-                                return@launch
+                    val outcome = runSendPass(
+                        account = account,
+                        recipient = recipient,
+                        context = context,
+                        sentTracker = sentTracker,
+                        onSuccess = { item ->
+                            withContext(Dispatchers.Main) {
+                                sendQueue = sendQueue - item
+                                sentCount += 1
                             }
-
-                            connection.use { conn ->
-                                for (item in channel) {
-                                    if (errorRef.get() != null) break
-                                    val baseName = item.name
-                                        .removeSuffix(".jpg")
-                                        .removeSuffix(".jpeg")
-                                        .removeSuffix(".png")
-                                        .removeSuffix(".webp")
-                                    val result = try {
-                                        val pdf = if (item.pdfPassthrough) {
-                                            PdfMaker.makePdfPassthrough(
-                                                context = context,
-                                                imageUri = item.uri,
-                                                outputDir = PdfMaker.outputDir(context),
-                                                baseName = baseName,
-                                            )
-                                        } else {
-                                            PdfMaker.makePdf(
-                                                context = context,
-                                                imageUri = item.uri,
-                                                outputDir = PdfMaker.outputDir(context),
-                                                baseName = baseName,
-                                                maxWidthPx = item.pdfMaxWidthPx
-                                                    ?: PdfMaker.DEFAULT_MAX_WIDTH_PX,
-                                            )
-                                        }
-                                        conn.send(
-                                            toEmail = recipient,
-                                            subject = baseName,
-                                            bodyText = "Receipt attached (sent from ReceiptSnap).",
-                                            attachment = pdf,
-                                        )
-                                    } catch (t: Throwable) {
-                                        SmtpSender.SendResult.Failure(
-                                            "Prepare failed: ${t.message}", t,
-                                        )
-                                    }
-
-                                    when (result) {
-                                        is SmtpSender.SendResult.Success -> {
-                                            sentTracker.markSent(item.uri)
-                                            // If this was a processed-folder
-                                            // crop, defer source archival to
-                                            // the post-loop pass so multiple
-                                            // crops sharing one source only
-                                            // move it once.
-                                            if (item.moveAfterSend) {
-                                                val srcUri = item.sourceUri
-                                                val srcName = item.sourceName
-                                                if (srcUri != null && srcName != null) {
-                                                    successfulSources.add(srcUri to srcName)
-                                                } else {
-                                                    // Legacy gallery path with uri == source
-                                                    runCatching {
-                                                        CoupaUploadsFolder.moveToArchive(
-                                                            context, item.uri, item.name,
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                            // Temp crop files: delete once
-                                            // successfully sent so the cache
-                                            // doesn't accumulate.
-                                            if (item.uri.scheme == "file") {
-                                                runCatching { java.io.File(item.uri.path!!).delete() }
-                                            }
-                                            withContext(Dispatchers.Main) {
-                                                sendQueue = sendQueue - item
-                                                sentCount += 1
-                                            }
-                                        }
-                                        is SmtpSender.SendResult.Failure -> {
-                                            val srcUri = item.sourceUri
-                                            val srcName = item.sourceName
-                                            if (srcUri != null && srcName != null) {
-                                                failedSources.add(srcUri to srcName)
-                                            }
-                                            errorRef.compareAndSet(null, result.message)
-                                        }
-                                    }
-                                }
+                        },
+                        currentQueue = { sendQueue },
+                    )
+                    when (outcome) {
+                        is PassOutcome.AllSent -> break
+                        is PassOutcome.FatalError -> {
+                            sendError = outcome.message
+                            break
+                        }
+                        is PassOutcome.LimitHit -> {
+                            if (!failover || accountIdx == accountOrder.lastIndex) {
+                                sendError = if (accountOrder.size > 1)
+                                    "Every saved account is rate-limited. Try again later. Last: ${outcome.message}"
+                                else
+                                    "Rate limit hit. Enable failover + add another account to continue. " +
+                                        "Server said: ${outcome.message}"
+                                break
                             }
+                            // else fall through to the next account
                         }
                     }
                 }
 
-                // Archive each source whose crops ALL landed successfully.
-                // Sources with partial failure stay put so the user can
-                // retry the remaining crops without having to re-import.
-                val sourcesToArchive = successfulSources - failedSources
-                withContext(Dispatchers.IO) {
-                    for ((srcUri, srcName) in sourcesToArchive) {
-                        runCatching { CoupaUploadsFolder.moveToArchive(context, srcUri, srcName) }
-                    }
-                }
-
-                val err = errorRef.get()
-                if (err != null) {
-                    sendError = err
-                } else if (sentCount > 0) {
+                if (sendError == null && sentCount > 0) {
                     Toast.makeText(
                         context,
                         "Sent $sentCount receipt${if (sentCount == 1) "" else "s"} to Coupa.",

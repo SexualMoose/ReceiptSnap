@@ -62,6 +62,19 @@ class SettingsStore(context: Context) {
     private val _senderEmail = MutableStateFlow(activeAccountOrNull()?.email ?: "")
     val senderEmail: StateFlow<String> = _senderEmail.asStateFlow()
 
+    /** When true, a send failure that looks like a rate/quota limit on the
+     *  active account auto-switches to the next saved account and
+     *  continues the remaining queue. Default on because it's useful
+     *  only when multiple accounts exist; with one account there's no
+     *  failover to attempt and the flag is a no-op. */
+    private val _failoverEnabled = MutableStateFlow(prefs.getBoolean(KEY_FAILOVER, true))
+    val failoverEnabled: StateFlow<Boolean> = _failoverEnabled.asStateFlow()
+
+    fun setFailoverEnabled(v: Boolean) {
+        prefs.edit().putBoolean(KEY_FAILOVER, v).apply()
+        _failoverEnabled.value = v
+    }
+
     init {
         // Make sure the mirrored flows match the initial active account.
         syncMirrorsFromActive()
@@ -176,6 +189,7 @@ class SettingsStore(context: Context) {
         _walletOverride.value = ""
         _accounts.value = emptyList()
         _activeAccountId.value = null
+        _failoverEnabled.value = true
         syncMirrorsFromActive()
     }
 
@@ -263,6 +277,7 @@ class SettingsStore(context: Context) {
         private const val KEY_OVERRIDE = "coupa_wallet_override"
         private const val KEY_ACCOUNTS = "smtp_accounts_json"
         private const val KEY_ACTIVE_ID = "smtp_active_account_id"
+        private const val KEY_FAILOVER = "smtp_failover_enabled"
 
         private const val DEFAULT_HOST = "bdpinternational.coupahost.com"
         private const val DEFAULT_EMAIL = "Tyler.Keller@psabdp.com"
