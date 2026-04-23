@@ -50,13 +50,16 @@ object ReceiptParser {
 
     // --- meal detection -----------------------------------------------------
 
-    // Both singular and plural since a receipt may say "Tips", "Meals",
-    // "Gratuities", or "Restaurants" in headers, totals, or category labels.
+    // Singular and plural. A receipt with a "Server" line, a "Table 12"
+    // marker, or a "Breakfast" category label is almost certainly a meal.
     private val MEAL_KEYWORDS = listOf(
         "restaurant", "restaurants",
         "tip", "tips",
         "gratuity", "gratuities",
         "meal", "meals",
+        "breakfast", "breakfasts",
+        "table", "tables",
+        "server", "servers",
     )
 
     private fun detectMeal(text: String): Boolean {

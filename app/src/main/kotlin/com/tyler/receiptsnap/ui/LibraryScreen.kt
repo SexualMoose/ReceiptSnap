@@ -2,7 +2,6 @@ package com.tyler.receiptsnap.ui
 
 import android.content.ContentUris
 import android.content.Context
-import android.content.Intent
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
@@ -66,8 +65,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.tyler.receiptsnap.ReceiptSnapApp
-import com.tyler.receiptsnap.processing.CoupaSender
 import com.tyler.receiptsnap.processing.PdfMaker
+import com.tyler.receiptsnap.processing.SmtpSender
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -93,13 +92,8 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
 
     var sendQueue by remember { mutableStateOf<List<LibraryItem>>(emptyList()) }
     var sentCount by remember { mutableIntStateOf(0) }
-
-    val sendLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { _ ->
-        sendQueue = sendQueue.drop(1)
-        sentCount += 1
-    }
+    var sendInFlight by remember { mutableStateOf(false) }
+    var sendError by remember { mutableStateOf<String?>(null) }
 
     // Android 11+ returns a pending intent for scoped-storage deletes that
     // need user confirmation (anything written by another app). Since we
@@ -129,30 +123,68 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         onDispose { resolver.unregisterContentObserver(observer) }
     }
 
-    fun launchNextInQueue() {
-        val next = sendQueue.firstOrNull() ?: return
+    /**
+     * Process the send queue automatically: build a PDF for each selected
+     * receipt and push it to Coupa via SMTP, with no email-client detour.
+     * Runs until the queue is empty or an SMTP error occurs.
+     */
+    fun runSendLoop() {
+        if (sendInFlight) return
         scope.launch {
-            val recipient = settings.currentWalletEmail()
-            if (recipient.isBlank()) {
-                Toast.makeText(context, "Set your Coupa address in Settings first.", Toast.LENGTH_LONG).show()
-                sendQueue = emptyList()
-                return@launch
+            sendInFlight = true
+            try {
+                while (sendQueue.isNotEmpty()) {
+                    val next = sendQueue.first()
+                    val recipient = settings.currentWalletEmail()
+                    if (recipient.isBlank()) {
+                        sendError = "Set Coupa host and email in Settings first."
+                        sendQueue = emptyList()
+                        return@launch
+                    }
+                    val config = SmtpSender.Config(
+                        host = settings.smtpHost.value,
+                        port = settings.smtpPort.value,
+                        fromEmail = settings.userEmail.value,
+                        password = settings.smtpPassword.value,
+                    )
+                    val result = withContext(Dispatchers.IO) {
+                        val pdf = PdfMaker.makePdf(
+                            context = context,
+                            imageUri = next.uri,
+                            outputDir = PdfMaker.outputDir(context),
+                            baseName = next.name.removeSuffix(".jpg"),
+                        )
+                        SmtpSender.send(
+                            config = config,
+                            toEmail = recipient,
+                            subject = next.name.removeSuffix(".jpg"),
+                            bodyText = "Receipt attached (sent from ReceiptSnap).",
+                            attachment = pdf,
+                        )
+                    }
+                    when (result) {
+                        is SmtpSender.SendResult.Success -> {
+                            sendQueue = sendQueue.drop(1)
+                            sentCount += 1
+                        }
+                        is SmtpSender.SendResult.Failure -> {
+                            sendError = result.message
+                            // Stop the queue — the same error will almost
+                            // certainly recur on the next item.
+                            return@launch
+                        }
+                    }
+                }
+                if (sentCount > 0) {
+                    Toast.makeText(
+                        context,
+                        "Sent $sentCount receipt${if (sentCount == 1) "" else "s"} to Coupa.",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            } finally {
+                sendInFlight = false
             }
-            val pdf = withContext(Dispatchers.IO) {
-                PdfMaker.makePdf(
-                    context = context,
-                    imageUri = next.uri,
-                    outputDir = PdfMaker.outputDir(context),
-                    baseName = next.name.removeSuffix(".jpg"),
-                )
-            }
-            val intent = CoupaSender.buildIntent(
-                context = context,
-                pdfFile = pdf,
-                recipient = recipient,
-                subject = next.name.removeSuffix(".jpg"),
-            )
-            sendLauncher.launch(Intent.createChooser(intent, "Send to Coupa"))
         }
     }
 
@@ -162,8 +194,9 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         if (queue.isEmpty()) return
         sendQueue = queue
         sentCount = 0
+        sendError = null
         selected = emptySet()
-        launchNextInQueue()
+        runSendLoop()
     }
 
     fun performDelete() {
@@ -216,10 +249,16 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             selectedCount = selected.size,
             queueSize = sendQueue.size,
             sentCount = sentCount,
+            sendInFlight = sendInFlight,
+            sendError = sendError,
             onCancelSelect = { selected = emptySet() },
             onStartSend = ::beginSend,
-            onSendNext = ::launchNextInQueue,
-            onClearQueue = { sendQueue = emptyList(); sentCount = 0 },
+            onClearQueue = {
+                sendQueue = emptyList()
+                sentCount = 0
+                sendError = null
+            },
+            onDismissError = { sendError = null },
             onRequestDelete = { confirmDelete = true },
         )
 
@@ -332,38 +371,54 @@ private fun Header(
     selectedCount: Int,
     queueSize: Int,
     sentCount: Int,
+    sendInFlight: Boolean,
+    sendError: String?,
     onCancelSelect: () -> Unit,
     onStartSend: () -> Unit,
-    onSendNext: () -> Unit,
     onClearQueue: () -> Unit,
+    onDismissError: () -> Unit,
     onRequestDelete: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         when {
-            queueSize > 0 -> {
+            sendError != null -> {
+                Text(
+                    text = "Coupa send failed",
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = sendError,
+                    color = Color.White.copy(alpha = 0.85f),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+                Row {
+                    TextButton(onClick = onStartSend) {
+                        Text("Retry", color = MaterialTheme.colorScheme.primary)
+                    }
+                    TextButton(onClick = onDismissError) {
+                        Text("Dismiss", color = Color.White.copy(alpha = 0.8f))
+                    }
+                }
+            }
+
+            queueSize > 0 || sendInFlight -> {
+                val total = sentCount + queueSize
+                val done = sentCount
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "Sending to Coupa · ${sentCount + 1} / ${sentCount + queueSize}",
+                        text = if (sendInFlight)
+                            "Sending to Coupa · ${done + 1} of $total…"
+                        else "Queued · $queueSize remaining",
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
                     )
-                    TextButton(onClick = onClearQueue) {
+                    TextButton(onClick = onClearQueue, enabled = !sendInFlight) {
                         Text("Stop", color = Color.White.copy(alpha = 0.8f))
                     }
-                }
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = onSendNext,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = Color.Black,
-                    ),
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
-                    Spacer(Modifier.size(6.dp))
-                    Text("Send next receipt")
                 }
             }
 

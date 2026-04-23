@@ -12,6 +12,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -30,6 +33,9 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
     val host by settings.companyHost.collectAsState()
     val email by settings.userEmail.collectAsState()
     val override by settings.walletOverride.collectAsState()
+    val smtpHost by settings.smtpHost.collectAsState()
+    val smtpPort by settings.smtpPort.collectAsState()
+    val smtpPassword by settings.smtpPassword.collectAsState()
     val derived = if (override.isBlank())
         com.tyler.receiptsnap.data.SettingsStore.deriveCoupaAddress(email, host)
     else override
@@ -81,8 +87,39 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
                 placeholder = "",
             )
             Text(
-                text = "Only set this if your Coupa wallet email doesn't " +
-                    "follow the FirstNameLastName@instance.coupa-expenses.com pattern.",
+                text = "Only set this if Coupa's expected address differs from the derived one.",
+                color = Color.White.copy(alpha = 0.55f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        Section(title = "Outgoing Email (SMTP)") {
+            DarkOutlinedField(
+                value = smtpHost,
+                onValueChange = settings::setSmtpHost,
+                label = "SMTP host",
+                placeholder = "smtp.office365.com",
+            )
+            DarkOutlinedField(
+                value = smtpPort.toString(),
+                onValueChange = { raw ->
+                    raw.toIntOrNull()?.let { settings.setSmtpPort(it) }
+                },
+                label = "SMTP port",
+                placeholder = "587",
+                keyboardType = KeyboardType.Number,
+            )
+            DarkOutlinedField(
+                value = smtpPassword,
+                onValueChange = settings::setSmtpPassword,
+                label = "SMTP password (or app password)",
+                placeholder = "",
+                isPassword = true,
+            )
+            Text(
+                text = "For Microsoft 365 with MFA, create an app password at " +
+                    "account.microsoft.com → Security → App passwords, and " +
+                    "paste it here.",
                 color = Color.White.copy(alpha = 0.55f),
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -109,6 +146,8 @@ private fun DarkOutlinedField(
     onValueChange: (String) -> Unit,
     label: String,
     placeholder: String,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    isPassword: Boolean = false,
 ) {
     OutlinedTextField(
         value = value,
@@ -117,6 +156,10 @@ private fun DarkOutlinedField(
         placeholder = { Text(placeholder, color = Color.White.copy(alpha = 0.35f)) },
         singleLine = true,
         modifier = Modifier.fillMaxWidth(),
+        visualTransformation = if (isPassword) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+        keyboardOptions = KeyboardOptions(
+            keyboardType = if (isPassword) KeyboardType.Password else keyboardType,
+        ),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = Color.White,
             unfocusedTextColor = Color.White,

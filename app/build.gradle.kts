@@ -50,6 +50,15 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            // JavaMail's two JARs each ship the same NOTICE.md / LICENSE.md
+            // — pick one.
+            pickFirsts += listOf(
+                "META-INF/NOTICE.md",
+                "META-INF/LICENSE.md",
+                "META-INF/NOTICE",
+                "META-INF/LICENSE",
+                "META-INF/DEPENDENCIES",
+            )
         }
         jniLibs {
             useLegacyPackaging = false
@@ -92,4 +101,6 @@ dependencies {
     implementation(libs.accompanist.permissions)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.coil.compose)
+    implementation(libs.android.mail)
+    implementation(libs.android.activation)
 }

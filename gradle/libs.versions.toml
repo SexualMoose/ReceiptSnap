@@ -1,5 +1,6 @@
 [versions]
 agp = "8.7.3"
+androidMail = "1.6.7"
 kotlin = "2.1.0"
 ksp = "2.1.0-1.0.29"
 coreKtx = "1.15.0"
@@ -50,6 +51,8 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 play-services-location = { group = "com.google.android.gms", name = "play-services-location", version.ref = "playServicesLocation" }
+android-mail = { group = "com.sun.mail", name = "android-mail", version.ref = "androidMail" }
+android-activation = { group = "com.sun.mail", name = "android-activation", version.ref = "androidMail" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

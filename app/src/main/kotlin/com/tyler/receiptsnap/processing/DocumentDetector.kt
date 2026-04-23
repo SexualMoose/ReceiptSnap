@@ -75,10 +75,13 @@ object DocumentDetector {
     private const val MAX_WHITE_CHROMA = 95.0
 
     /** Keywords whose presence on a receipt is required for it to be treated
-     *  as a receipt (alongside at least one date). These are the printed
-     *  tokens a real receipt typically carries — not just "TOTAL" which
-     *  appears on lots of non-receipt text. */
-    private val RECEIPT_KEYWORDS = listOf("MERCHANT", "CARDHOLDER", "AUTH", "RESTAURANT")
+     *  as a receipt (alongside at least one date). Expanded to cover common
+     *  card-payment vocabulary so receipts without an explicit MERCHANT or
+     *  AUTH line still qualify. */
+    private val RECEIPT_KEYWORDS = listOf(
+        "MERCHANT", "CARDHOLDER", "AUTH", "RESTAURANT",
+        "RECEIPT", "PAYMENT", "VISA", "MASTERCARD", "CHARGE",
+    )
 
     /** Phone numbers count as a "phone" marker whether the literal word is
      *  present or not — most receipts just print the number. */
@@ -358,6 +361,12 @@ object DocumentDetector {
     }
 
     private fun canMerge(a: Cluster, b: Cluster): Boolean {
+        // Guardrail: if both clusters *independently* look like receipts
+        // (each has a date AND a keyword hit), they're almost certainly
+        // two separate receipts that happen to sit near each other. Merging
+        // would silently collapse them. Leave them apart.
+        if (isReceiptCluster(a) && isReceiptCluster(b)) return false
+
         if (angleDistance(a.medianAngleRad, b.medianAngleRad) > MERGE_ANGLE_TOLERANCE_RAD) return false
         val mergeAngle = averageAngle(a.medianAngleRad, b.medianAngleRad)
         val aLoc = localExtents(a.lines.flatMap { it.corners }, mergeAngle)
@@ -383,17 +392,74 @@ object DocumentDetector {
         return !(a1 + gap < b0 || b1 + gap < a0)
     }
 
-    /** Receipt validity: at least one date AND at least one of the required
-     *  keywords (merchant/cardholder/auth/restaurant) OR a phone number. */
+    /** Receipt validity: at least one date AND at least one required keyword
+     *  (receipt/merchant/cardholder/auth/restaurant/payment/visa/mastercard/
+     *  charge) OR a phone number. Fuzzy keyword matching tolerates common
+     *  OCR errors — printed receipts frequently have one-character
+     *  substitutions (e.g., "MERCHAN1" for "MERCHANT"). */
     private fun isReceiptCluster(cluster: Cluster): Boolean {
         val joined = cluster.lines.joinToString("\n") { it.text }
-        val upper = joined.uppercase()
-        val hasKeyword = RECEIPT_KEYWORDS.any { kw ->
-            Regex("\\b$kw\\b").containsMatchIn(upper)
-        } || Regex("\\bPHONE\\b").containsMatchIn(upper) || PHONE_NUMBER.containsMatchIn(joined)
-        if (!hasKeyword) return false
-        val dates = ReceiptParser.allDatesInText(joined)
-        return dates.isNotEmpty()
+        return countReceiptSignals(joined) >= 1 &&
+            ReceiptParser.allDatesInText(joined).isNotEmpty()
+    }
+
+    /** Counts distinct receipt-signal hits in `text`. Used both by the gate
+     *  and by the merge-guard: if two clusters each hit ≥ 1 signal, they
+     *  probably represent two separate receipts and should NOT merge. */
+    private fun countReceiptSignals(text: String): Int {
+        val words = Regex("[A-Za-z]+").findAll(text.uppercase()).map { it.value }.toList()
+        var hits = 0
+        val found = mutableSetOf<String>()
+        for (w in words) {
+            for (kw in RECEIPT_KEYWORDS) {
+                if (kw in found) continue
+                if (fuzzyMatch(w, kw)) {
+                    found += kw
+                    hits++
+                    break
+                }
+            }
+        }
+        if (PHONE_NUMBER.containsMatchIn(text)) hits++
+        return hits
+    }
+
+    /** Tokens match when they're equal OR differ by at most one edit
+     *  (insertion / deletion / substitution), provided the reference
+     *  keyword is at least 5 chars long (shorter keywords can't safely
+     *  absorb an edit without producing false positives). */
+    private fun fuzzyMatch(token: String, keyword: String): Boolean {
+        if (token == keyword) return true
+        if (keyword.length < 5) return false
+        val diff = kotlin.math.abs(token.length - keyword.length)
+        if (diff > 1) return false
+        return editDistance(token, keyword, maxEdits = 1) <= 1
+    }
+
+    private fun editDistance(a: String, b: String, maxEdits: Int): Int {
+        if (a == b) return 0
+        val la = a.length; val lb = b.length
+        if (kotlin.math.abs(la - lb) > maxEdits) return maxEdits + 1
+
+        // Classic DP but with early-exit once the running min exceeds maxEdits.
+        var prev = IntArray(lb + 1) { it }
+        var curr = IntArray(lb + 1)
+        for (i in 1..la) {
+            curr[0] = i
+            var rowMin = i
+            for (j in 1..lb) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                curr[j] = minOf(
+                    prev[j] + 1,
+                    curr[j - 1] + 1,
+                    prev[j - 1] + cost,
+                )
+                if (curr[j] < rowMin) rowMin = curr[j]
+            }
+            if (rowMin > maxEdits) return maxEdits + 1
+            val tmp = prev; prev = curr; curr = tmp
+        }
+        return prev[lb]
     }
 
     private fun clusterToQuad(cluster: Cluster, id: Long): Quad {

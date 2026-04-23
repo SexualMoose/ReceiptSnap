@@ -20,8 +20,8 @@ import java.util.Locale
  */
 object AddressParser {
 
-    private const val MIN_ACCEPT_SCORE = 4
-    private const val MIN_MARGIN = 1   // over #2 candidate
+    private const val MIN_ACCEPT_SCORE = 3
+    private const val MIN_MARGIN = 0   // over #2 candidate (allow ties on same label)
     private const val MAX_LABEL_LEN = 24
 
     fun extractLocation(text: String): String? {
@@ -38,9 +38,20 @@ object AddressParser {
         val candidates = mutableListOf<Candidate>()
         candidates += postalAnchoredCandidates(window)
         candidates += streetAnchoredCandidates(window)
-        candidates += countryOnlyCandidates(window)
+        candidates += whitelistCandidates(lines)          // scan full text
+        candidates += countryOnlyCandidates(lines)
 
-        val sorted = candidates.sortedByDescending { it.score }
+        // Consolidate: sum scores of candidates with the same sanitized label.
+        val consolidated = candidates
+            .groupBy { sanitize(it.label).lowercase() }
+            .map { (_, group) ->
+                Candidate(
+                    label = group.first().label,
+                    score = group.sumOf { it.score },
+                )
+            }
+
+        val sorted = consolidated.sortedByDescending { it.score }
         val best = sorted.firstOrNull() ?: return null
         if (best.score < MIN_ACCEPT_SCORE) return null
         val second = sorted.getOrNull(1)
@@ -256,17 +267,122 @@ object AddressParser {
         "brasil" to "Brazil", "brazil" to "Brazil",
     )
 
-    private fun countryOnlyCandidates(window: List<Line>): List<Candidate> {
+    private fun countryOnlyCandidates(lines: List<Line>): List<Candidate> {
         val out = mutableListOf<Candidate>()
-        val joinedLower = window.joinToString(" ") { it.normalized.lowercase(Locale.US) }
+        val joinedLower = lines.joinToString(" ") { it.normalized.lowercase(Locale.US) }
         for ((alias, canonical) in COUNTRY_ALIASES) {
             if (Regex("\\b${Regex.escape(alias)}\\b").containsMatchIn(joinedLower)) {
                 // Country alone is a weak label — score low so city/state win.
-                out += Candidate(canonical, 3)
-                break
+                out += Candidate(canonical, 2)
             }
         }
         return out
+    }
+
+    // Tier D: whitelist of major cities (and a few city-regions). When a
+    // receipt lacks a recognizable postal code — typical for a stub like a
+    // hotel restaurant check that only prints the brand "Hilton London
+    // Metropole" — we still want "London" to surface. Matching against a
+    // curated list is safer than guessing proper nouns because the list
+    // contains only well-known place names; a false positive would have to
+    // be the *literal word* "London" or "Paris" appearing for some other
+    // reason, which is vanishingly rare on a receipt.
+    private val MAJOR_CITIES: Set<String> = setOf(
+        // UK — London boroughs/areas included so merchant addresses like
+        // "Paddington W2 1RL" surface the local name before the city.
+        "London", "Paddington", "Westminster", "Camden", "Islington", "Hackney",
+        "Southwark", "Greenwich", "Chelsea", "Kensington", "Mayfair", "Soho",
+        "Shoreditch", "Covent Garden", "Bloomsbury", "Marylebone", "Clerkenwell",
+        "Manchester", "Birmingham", "Leeds", "Liverpool", "Glasgow", "Edinburgh",
+        "Bristol", "Cardiff", "Belfast", "Newcastle", "Sheffield", "Nottingham",
+        "Leicester", "Brighton", "Oxford", "Cambridge", "Reading", "York",
+        "Southampton", "Portsmouth", "Coventry", "Bradford",
+
+        // US cities
+        "New York", "Los Angeles", "Chicago", "Houston", "Phoenix", "Philadelphia",
+        "San Antonio", "San Diego", "Dallas", "San Jose", "Austin", "Jacksonville",
+        "Fort Worth", "Columbus", "San Francisco", "Charlotte", "Indianapolis",
+        "Seattle", "Denver", "Boston", "Nashville", "Oklahoma City", "Las Vegas",
+        "Portland", "Memphis", "Louisville", "Baltimore", "Milwaukee",
+        "Albuquerque", "Tucson", "Fresno", "Sacramento", "Kansas City",
+        "Long Beach", "Mesa", "Atlanta", "Omaha", "Colorado Springs", "Raleigh",
+        "Miami", "Cleveland", "New Orleans", "Tampa", "Minneapolis", "Honolulu",
+        "Anaheim", "Saint Louis", "Cincinnati", "Pittsburgh", "Orlando",
+        "Anchorage", "Washington", "Brooklyn", "Manhattan", "Queens", "Bronx",
+        "Newark", "Detroit", "Buffalo", "Richmond", "Salt Lake City",
+
+        // Canada
+        "Toronto", "Montreal", "Vancouver", "Calgary", "Edmonton", "Ottawa",
+        "Winnipeg", "Quebec", "Halifax", "Mississauga", "Brampton", "Hamilton",
+        "Victoria", "Saskatoon",
+
+        // EU
+        "Paris", "Berlin", "Madrid", "Rome", "Milan", "Barcelona", "Amsterdam",
+        "Brussels", "Vienna", "Dublin", "Stockholm", "Copenhagen", "Oslo",
+        "Helsinki", "Warsaw", "Prague", "Budapest", "Lisbon", "Athens", "Zurich",
+        "Geneva", "Munich", "Hamburg", "Frankfurt", "Cologne", "Stuttgart",
+        "Dusseldorf", "Rotterdam", "The Hague", "Antwerp", "Ghent", "Lyon",
+        "Marseille", "Nice", "Toulouse", "Bordeaux", "Florence", "Venice",
+        "Naples", "Turin", "Seville", "Valencia", "Bilbao", "Porto",
+        "Thessaloniki", "Krakow",
+
+        // Asia / Pacific
+        "Tokyo", "Osaka", "Kyoto", "Seoul", "Beijing", "Shanghai", "Hong Kong",
+        "Singapore", "Bangkok", "Mumbai", "Delhi", "New Delhi", "Bangalore",
+        "Dubai", "Abu Dhabi", "Taipei", "Kuala Lumpur", "Manila", "Jakarta",
+        "Ho Chi Minh", "Hanoi", "Sydney", "Melbourne", "Brisbane", "Perth",
+        "Adelaide", "Auckland", "Wellington", "Christchurch",
+
+        // Latin America, Africa, Middle East
+        "Mexico City", "Sao Paulo", "Buenos Aires", "Bogota", "Lima", "Santiago",
+        "Rio De Janeiro", "Cairo", "Johannesburg", "Cape Town", "Nairobi",
+        "Moscow", "Istanbul", "Jerusalem", "Tel Aviv", "Doha", "Riyadh",
+    )
+
+    /** Lowercased lookup with underscore → space. Built at init time. */
+    private val MAJOR_CITIES_LOWER: Map<String, String> = MAJOR_CITIES
+        .associateBy { it.lowercase(Locale.US) }
+
+    private fun whitelistCandidates(lines: List<Line>): List<Candidate> {
+        val out = mutableListOf<Candidate>()
+        for (i in lines.indices) {
+            val lineText = lines[i].normalized
+            val lower = lineText.lowercase(Locale.US)
+            // Skip empty and extremely long lines (unlikely to be addresses).
+            if (lower.isBlank() || lower.length > 120) continue
+
+            for ((lookup, canonical) in MAJOR_CITIES_LOWER) {
+                // Whole-word match. For multi-word cities (e.g. "New York")
+                // this matches correctly because the regex boundary works
+                // against surrounding whitespace/punctuation.
+                val pattern = Regex("\\b${Regex.escape(lookup)}\\b")
+                if (!pattern.containsMatchIn(lower)) continue
+
+                // Positional score — higher when near the top (classic
+                // address-block position) or near any postal code pattern
+                // elsewhere in the text.
+                val posBoost = when {
+                    i < 5 -> 3
+                    i < 10 -> 2
+                    else -> 1
+                }
+                // Boost when the line also carries postal/street anchors.
+                val anchorBoost = when {
+                    US_POSTAL.containsMatchIn(lineText) -> 2
+                    UK_POSTAL.containsMatchIn(lineText) -> 2
+                    CA_POSTAL.containsMatchIn(lineText) -> 2
+                    hasStreetSuffix(lower) -> 1
+                    else -> 0
+                }
+                out += Candidate(canonical, 2 + posBoost + anchorBoost)
+            }
+        }
+        return out
+    }
+
+    private fun hasStreetSuffix(lower: String): Boolean {
+        val tokens = lower.split(Regex("[\\s,.]+")).filter { it.isNotBlank() }
+        return tokens.any { it in STREET_SUFFIXES }
     }
 
     // --- token helpers ------------------------------------------------------

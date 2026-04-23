@@ -32,11 +32,38 @@ class SettingsStore(context: Context) {
     private val _walletOverride = MutableStateFlow(prefs.getString(KEY_OVERRIDE, "") ?: "")
     val walletOverride: StateFlow<String> = _walletOverride.asStateFlow()
 
+    private val _smtpHost = MutableStateFlow(prefs.getString(KEY_SMTP_HOST, DEFAULT_SMTP_HOST) ?: DEFAULT_SMTP_HOST)
+    val smtpHost: StateFlow<String> = _smtpHost.asStateFlow()
+
+    private val _smtpPort = MutableStateFlow(prefs.getInt(KEY_SMTP_PORT, DEFAULT_SMTP_PORT))
+    val smtpPort: StateFlow<Int> = _smtpPort.asStateFlow()
+
+    private val _smtpPassword = MutableStateFlow(prefs.getString(KEY_SMTP_PASSWORD, "") ?: "")
+    val smtpPassword: StateFlow<String> = _smtpPassword.asStateFlow()
+
     /** Derived (or overridden) wallet address to send receipts to. */
     fun currentWalletEmail(): String {
         val override = _walletOverride.value.trim()
         if (override.isNotBlank()) return override
         return deriveCoupaAddress(_userEmail.value, _companyHost.value)
+    }
+
+    fun setSmtpHost(value: String) {
+        val v = value.trim()
+        prefs.edit().putString(KEY_SMTP_HOST, v).apply()
+        _smtpHost.value = v
+    }
+
+    fun setSmtpPort(value: Int) {
+        prefs.edit().putInt(KEY_SMTP_PORT, value).apply()
+        _smtpPort.value = value
+    }
+
+    fun setSmtpPassword(value: String) {
+        // Not trimmed — some passwords legitimately contain leading/trailing
+        // whitespace, and app passwords sometimes include spaces.
+        prefs.edit().putString(KEY_SMTP_PASSWORD, value).apply()
+        _smtpPassword.value = value
     }
 
     fun setCompanyHost(value: String) {
@@ -62,27 +89,39 @@ class SettingsStore(context: Context) {
         private const val KEY_HOST = "company_host"
         private const val KEY_EMAIL = "user_email"
         private const val KEY_OVERRIDE = "coupa_wallet_override"
+        private const val KEY_SMTP_HOST = "smtp_host"
+        private const val KEY_SMTP_PORT = "smtp_port"
+        private const val KEY_SMTP_PASSWORD = "smtp_password"
 
         // Pre-seeded so the app sends correctly on first run without a detour
         // through Settings. User can change anytime.
         private const val DEFAULT_HOST = "bdpinternational.coupahost.com"
-        private const val DEFAULT_EMAIL = "tyler.keller@psabdp.com"
+        private const val DEFAULT_EMAIL = "Tyler.Keller@psabdp.com"
 
+        // Office 365 is BDP's likely mail provider. 587 is the STARTTLS
+        // submission port. If the tenant has disabled basic-auth SMTP the
+        // user will need an app password or a different host.
+        private const val DEFAULT_SMTP_HOST = "smtp.office365.com"
+        private const val DEFAULT_SMTP_PORT = 587
+
+        /**
+         * Coupa's receipt-ingest address encodes the sender's full email
+         * (local+domain concatenated, @ removed) in the local-part so Coupa
+         * can attribute the receipt regardless of the SMTP From header.
+         * Example: tyler.keller@psabdp.com + bdpinternational.coupahost.com
+         *       → tyler.kellerpsabdp.com@bdpinternational.coupa-expenses.com
+         */
         fun deriveCoupaAddress(email: String, host: String): String {
-            val e = email.trim(); val h = host.trim()
+            val e = email.trim().lowercase(Locale.US)
+            val h = host.trim().lowercase(Locale.US)
             if (e.isBlank() || h.isBlank() || !e.contains("@")) return ""
             val local = e.substringBefore("@")
-            val name = local
-                .split('.', '_', '-', ' ')
-                .filter { it.isNotBlank() }
-                .joinToString("") { part ->
-                    part.replaceFirstChar { it.titlecase(Locale.US) }
-                }
-            if (name.isBlank()) return ""
+            val domain = e.substringAfter("@")
+            if (local.isBlank() || domain.isBlank()) return ""
             val instance = h.removePrefix("https://").removePrefix("http://")
                 .substringBefore("/").substringBefore(".").trim()
             if (instance.isBlank()) return ""
-            return "$name@$instance.coupa-expenses.com"
+            return "$local$domain@$instance.coupa-expenses.com"
         }
     }
 }
