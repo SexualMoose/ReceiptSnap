@@ -50,7 +50,14 @@ object ReceiptParser {
 
     // --- meal detection -----------------------------------------------------
 
-    private val MEAL_KEYWORDS = listOf("restaurant", "tip", "gratuity", "meal")
+    // Both singular and plural since a receipt may say "Tips", "Meals",
+    // "Gratuities", or "Restaurants" in headers, totals, or category labels.
+    private val MEAL_KEYWORDS = listOf(
+        "restaurant", "restaurants",
+        "tip", "tips",
+        "gratuity", "gratuities",
+        "meal", "meals",
+    )
 
     private fun detectMeal(text: String): Boolean {
         val lower = text.lowercase(Locale.US)
