@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -38,6 +39,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 fun CameraScreen(
     busy: Boolean,
     statusText: String?,
+    captureProgress: Int,
+    captureTotal: Int,
     modifier: Modifier = Modifier,
     onCapture: (controller: CameraController, lifecycleOwner: androidx.lifecycle.LifecycleOwner, previewView: PreviewView) -> Unit,
 ) {
@@ -78,6 +81,23 @@ fun CameraScreen(
                 Text(
                     text = statusText,
                     color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            // Capture progress bar. Visible only during multi-camera
+            // capture so the user knows the shutter click isn't frozen —
+            // each secondary lens takes ~2 s to rebind and fire.
+            if (captureTotal > 0) {
+                LinearProgressIndicator(
+                    progress = {
+                        if (captureTotal == 0) 0f
+                        else (captureProgress.toFloat() / captureTotal).coerceIn(0f, 1f)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth(0.72f)
+                        .padding(vertical = 4.dp),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
                 )
             }
 

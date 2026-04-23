@@ -94,10 +94,15 @@ class CameraController(private val context: Context) {
      * each other lens in turn and a JPEG is captured so the user can review
      * multiple viewpoints. Returns the list in primary-first order. The
      * preview is re-bound to the primary lens on completion.
+     *
+     * [onProgress] fires before each individual capture with (completed,
+     * totalPlanned, lensKindLabel) so the UI can show a progress bar
+     * during the 4–5 second sequence.
      */
     suspend fun captureAll(
         lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
+        onProgress: ((completed: Int, total: Int, label: String) -> Unit)? = null,
     ): List<CapturedFrame> {
         val cameraProvider = provider ?: error("Camera not bound")
         val lenses = knownLenses
@@ -121,15 +126,18 @@ class CameraController(private val context: Context) {
                 }
             }
 
+        val total = 1 + secondaryOrder.size
         val frames = mutableListOf<CapturedFrame>()
 
         // Primary — preview is already bound to this lens.
+        onProgress?.invoke(0, total, primary.kind.name)
         runCatching { captureOnce() }
             .onSuccess { frames += CapturedFrame(it, primary) }
             .onFailure { Log.e(TAG, "Primary capture failed on ${primary.kind}", it) }
 
         // Secondary / tertiary — rebind briefly, capture, rebind back.
-        for (lens in secondaryOrder) {
+        for ((i, lens) in secondaryOrder.withIndex()) {
+            onProgress?.invoke(1 + i, total, lens.kind.name)
             try {
                 bindLens(cameraProvider, lifecycleOwner, previewView, lens)
                 frames += CapturedFrame(captureOnce(), lens)
@@ -137,6 +145,7 @@ class CameraController(private val context: Context) {
                 Log.w(TAG, "Secondary capture failed on ${lens.kind}", t)
             }
         }
+        onProgress?.invoke(total, total, "Done")
 
         // Leave preview bound to the primary lens.
         runCatching { bindLens(cameraProvider, lifecycleOwner, previewView, primary) }

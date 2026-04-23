@@ -151,6 +151,42 @@ object DocumentDetector {
         return result
     }
 
+    /**
+     * Text-driven version of growFromSeed. Crops a region around the tap,
+     * upscales 3×, runs multi-rotation OCR on just that region, and forms
+     * an oriented bounding quad from whatever text cluster contains (or is
+     * nearest to) the seed point. This is the fallback the VM uses when
+     * both the flood-fill growth and the secondary-camera retry miss.
+     */
+    suspend fun growFromSeedWithText(
+        source: Bitmap, seedX: Double, seedY: Double, nextId: Long,
+    ): Quad? {
+        // Focus on a generous region around the tap — roughly the footprint
+        // of a typical receipt at arm's length.
+        val regionW = (source.width * 0.45).toInt().coerceAtMost(source.width)
+        val regionH = (source.height * 0.55).toInt().coerceAtMost(source.height)
+        val x0 = (seedX - regionW / 2).toInt().coerceIn(0, source.width - regionW)
+        val y0 = (seedY - regionH / 2).toInt().coerceIn(0, source.height - regionH)
+
+        val lines = ocrRegion(source, x0, y0, regionW, regionH, upscale = 3.0)
+        if (lines.isEmpty()) return null
+
+        // Cluster the lines we found locally; pick the cluster closest to
+        // the seed (or the one that contains it).
+        val clusters = clusterLines(lines)
+        if (clusters.isEmpty()) return null
+
+        val seed = CvPoint(seedX, seedY)
+        val chosen = clusters.minByOrNull { cluster ->
+            val cx = cluster.lines.map { it.center.x }.average()
+            val cy = cluster.lines.map { it.center.y }.average()
+            val dx = cx - seed.x; val dy = cy - seed.y
+            dx * dx + dy * dy
+        } ?: return null
+
+        return clusterToQuad(chosen, nextId)
+    }
+
     suspend fun growFromSeed(source: Bitmap, seedX: Double, seedY: Double, nextId: Long): Quad? {
         val lines = recognizeLines(source)
         if (lines.isEmpty()) return null
@@ -302,19 +338,19 @@ object DocumentDetector {
         val forOcr = if (ocrW == cropped.width && ocrH == cropped.height) cropped
         else Bitmap.createScaledBitmap(cropped, ocrW, ocrH, true)
 
+        // Single-pass OCR. ML Kit's latin text recognizer is already
+        // rotation-invariant — it returns corner points with rotation info
+        // for text at any orientation within a single detection pass.
+        // Running multiple rotation hints re-detects the same text in
+        // different coordinate frames, producing spurious duplicates after
+        // un-rotation, so we don't do that.
         val text = runOcr(forOcr)
-
-        if (forOcr !== cropped) forOcr.recycle()
-        if (cropped !== source) cropped.recycle()
-
         val inv = 1.0 / scale
         val out = mutableListOf<LineInfo>()
         for (block in text.textBlocks) {
             for (line in block.lines) {
                 val cp = line.cornerPoints ?: continue
                 if (cp.size != 4) continue
-                // Transform OCR coords back to original-image coords:
-                // original = tileOffset + (ocrCoord * inv)
                 val tl = CvPoint(srcX + cp[0].x * inv, srcY + cp[0].y * inv)
                 val tr = CvPoint(srcX + cp[1].x * inv, srcY + cp[1].y * inv)
                 val br = CvPoint(srcX + cp[2].x * inv, srcY + cp[2].y * inv)
@@ -330,15 +366,19 @@ object DocumentDetector {
                 out += LineInfo(line.text, listOf(tl, tr, br, bl), center, angle, height, width)
             }
         }
+
+        if (forOcr !== cropped) forOcr.recycle()
+        if (cropped !== source) cropped.recycle()
         return out
     }
 
-    private suspend fun runOcr(bitmap: Bitmap): Text = suspendCancellableCoroutine { cont ->
-        val img = InputImage.fromBitmap(bitmap, 0)
-        recognizer.process(img)
-            .addOnSuccessListener { cont.resume(it) }
-            .addOnFailureListener { cont.resumeWithException(it) }
-    }
+    private suspend fun runOcr(bitmap: Bitmap): Text =
+        suspendCancellableCoroutine { cont ->
+            val img = InputImage.fromBitmap(bitmap, 0)
+            recognizer.process(img)
+                .addOnSuccessListener { cont.resume(it) }
+                .addOnFailureListener { cont.resumeWithException(it) }
+        }
 
     /**
      * Single-link clustering over all lines — no angle buckets. Two lines are

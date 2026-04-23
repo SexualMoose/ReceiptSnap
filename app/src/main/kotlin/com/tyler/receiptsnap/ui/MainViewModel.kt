@@ -53,6 +53,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val phase: Phase = Phase.Camera,
         val busy: Boolean = false,
         val status: String? = null,
+        /** When > 0, a capture sequence is running: [captureProgress] is the
+         *  number of cameras captured so far and [captureTotal] is how many
+         *  we plan to take. UI uses this to draw a progress bar. */
+        val captureProgress: Int = 0,
+        val captureTotal: Int = 0,
         val lastSaved: List<SavedReceipt> = emptyList(),
         val error: String? = null,
     )
@@ -63,18 +68,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun capture(controller: CameraController, lifecycleOwner: androidx.lifecycle.LifecycleOwner, previewView: androidx.camera.view.PreviewView) {
         if (_state.value.busy) return
         viewModelScope.launch {
-            _state.value = _state.value.copy(busy = true, status = "Capturing primary…", error = null)
+            _state.value = _state.value.copy(
+                busy = true,
+                status = "Capturing…",
+                error = null,
+                captureProgress = 0,
+                captureTotal = 3,  // rough estimate; corrected by first progress callback
+            )
 
             val frames = try {
-                controller.captureAll(lifecycleOwner, previewView)
+                controller.captureAll(lifecycleOwner, previewView) { done, total, label ->
+                    _state.value = _state.value.copy(
+                        captureProgress = done,
+                        captureTotal = total,
+                        status = "Capturing $label · ${done + 1} of $total",
+                    )
+                }
             } catch (t: Throwable) {
                 Log.e(TAG, "captureAll failed", t)
                 emptyList()
             }
             if (frames.isEmpty()) {
-                _state.value = _state.value.copy(busy = false, status = null, error = "Capture failed.")
+                _state.value = _state.value.copy(
+                    busy = false, status = null, error = "Capture failed.",
+                    captureProgress = 0, captureTotal = 0,
+                )
                 return@launch
             }
+            _state.value = _state.value.copy(captureProgress = 0, captureTotal = 0)
 
             val primary = frames.first()
             val secondaries = frames.drop(1).map { f ->
@@ -150,8 +171,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         Log.w(TAG, "growFromSeed on secondary failed", t); null
                     }
                     if (hit != null) {
-                        // Translate corners back into primary coords so the
-                        // review overlay can render them correctly.
+                        val primaryCorners = hit.corners.map { p ->
+                            val back = mapCoordsBack(phase.bitmap, sec, p.x, p.y) ?: return@map p
+                            org.opencv.core.Point(back.first, back.second)
+                        }
+                        return@withContext DocumentDetector.Quad(
+                            id = hit.id,
+                            corners = primaryCorners,
+                        )
+                    }
+                }
+
+                // Last resort: 3× upscaled text-based grow. Much more
+                // expensive than flood-fill but it handles the case where
+                // the receipt is low-contrast against the surface yet
+                // still OCR-able when given more pixel budget. Try each
+                // frame in turn (primary first).
+                val upscaledOnPrimary = try {
+                    DocumentDetector.growFromSeedWithText(phase.bitmap, seedX, seedY, phase.nextQuadId)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "growFromSeedWithText on primary failed", t); null
+                }
+                if (upscaledOnPrimary != null) return@withContext upscaledOnPrimary
+
+                for (sec in phase.secondaries) {
+                    val mapped = mapCoords(phase.bitmap, sec, seedX, seedY) ?: continue
+                    val hit = try {
+                        DocumentDetector.growFromSeedWithText(sec.bitmap, mapped.first, mapped.second, phase.nextQuadId)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "growFromSeedWithText on secondary failed", t); null
+                    }
+                    if (hit != null) {
                         val primaryCorners = hit.corners.map { p ->
                             val back = mapCoordsBack(phase.bitmap, sec, p.x, p.y) ?: return@map p
                             org.opencv.core.Point(back.first, back.second)

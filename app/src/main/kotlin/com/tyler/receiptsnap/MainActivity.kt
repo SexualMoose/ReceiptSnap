@@ -108,6 +108,8 @@ private fun Root(viewModel: MainViewModel) {
                 Tab.Capture -> CameraScreen(
                     busy = state.busy,
                     statusText = state.error ?: state.status,
+                    captureProgress = state.captureProgress,
+                    captureTotal = state.captureTotal,
                     onCapture = { ctl, lc, pv -> viewModel.capture(ctl, lc, pv) },
                 )
                 Tab.Library -> LibraryScreen()
