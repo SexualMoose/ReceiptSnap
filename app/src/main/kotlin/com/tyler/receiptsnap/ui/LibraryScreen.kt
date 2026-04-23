@@ -12,6 +12,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.documentfile.provider.DocumentFile
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,6 +39,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -111,6 +113,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             selected = emptySet()
         }
     }
+
 
     LaunchedEffect(refreshTick) {
         items = withContext(Dispatchers.IO) { loadItems(context) }
@@ -207,6 +210,41 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         runSendLoop()
     }
 
+    // External-folder upload: user picks any directory (Downloads, a backup
+    // folder, a screenshot album, etc.) via SAF; we enumerate every image
+    // file inside and push each through the same PDF+SMTP pipeline the
+    // in-app gallery uses. No detection — we assume each file is one
+    // receipt, ready to upload.
+    val folderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri == null) return@rememberLauncherForActivityResult
+        // Persist read access for this tree across process restarts so a
+        // resumed queue keeps working.
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                treeUri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        val root = DocumentFile.fromTreeUri(context, treeUri) ?: return@rememberLauncherForActivityResult
+        val imageFiles = root.listFiles()
+            .filter { it.isFile && (it.type?.startsWith("image/") == true) }
+            .sortedBy { it.name ?: "" }
+        if (imageFiles.isEmpty()) {
+            Toast.makeText(context, "No images found in selected folder.", Toast.LENGTH_SHORT).show()
+            return@rememberLauncherForActivityResult
+        }
+        val now = System.currentTimeMillis() / 1000
+        sendQueue = imageFiles.map { f ->
+            LibraryItem(uri = f.uri, name = f.name ?: "receipt.jpg", dateAddedSec = now)
+        }
+        sentCount = 0
+        sendError = null
+        selected = emptySet()
+        runSendLoop()
+    }
+
     fun performDelete() {
         val uris = items.filter { it.uri in selected }.map { it.uri }
         if (uris.isEmpty()) return
@@ -268,6 +306,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             },
             onDismissError = { sendError = null },
             onRequestDelete = { confirmDelete = true },
+            onUploadFolder = { folderLauncher.launch(null) },
         )
 
         if (items.isEmpty()) {
@@ -410,6 +449,7 @@ private fun Header(
     onClearQueue: () -> Unit,
     onDismissError: () -> Unit,
     onRequestDelete: () -> Unit,
+    onUploadFolder: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         when {
@@ -488,13 +528,26 @@ private fun Header(
             }
 
             else -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "Library · $totalCount",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = onUploadFolder) {
+                        Icon(
+                            Icons.Default.FolderOpen,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.size(4.dp))
+                        Text("Upload folder", color = MaterialTheme.colorScheme.primary)
+                    }
+                }
                 Text(
-                    text = "Library · $totalCount",
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    text = "Tap to view · Long-press to select",
+                    text = "Tap to view · Long-press to select · Upload folder sends every image " +
+                        "in a chosen directory through the same PDF + SMTP pipeline.",
                     color = Color.White.copy(alpha = 0.6f),
                     style = MaterialTheme.typography.bodySmall,
                 )
