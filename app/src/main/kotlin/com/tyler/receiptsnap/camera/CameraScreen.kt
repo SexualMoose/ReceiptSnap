@@ -38,6 +38,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 fun CameraScreen(
     busy: Boolean,
     statusText: String?,
+    modifier: Modifier = Modifier,
     onCapture: (controller: CameraController) -> Unit,
 ) {
     val context = LocalContext.current
@@ -45,7 +46,7 @@ fun CameraScreen(
     val controller = remember { CameraController(context) }
     val previewViewState = remember { mutableStateOf<PreviewView?>(null) }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
@@ -69,9 +70,9 @@ fun CameraScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 48.dp, top = 24.dp),
+                .padding(bottom = 24.dp, top = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (statusText != null) {
                 Text(

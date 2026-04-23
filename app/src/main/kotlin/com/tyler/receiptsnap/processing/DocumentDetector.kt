@@ -15,62 +15,148 @@ import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 
 /**
- * Detects one or more document-like quadrilaterals in a photo and returns each
- * perspective-corrected as a separate Bitmap. Designed for receipts laid out
- * on a (roughly) uniform surface.
+ * Finds one or more document-like quadrilaterals in a photo. Detection and
+ * warping are separate so the review UI can edit the quad set before commit.
+ *
+ * Coordinates in returned Quads are in the *original* bitmap pixel space.
+ *
+ * Two filters rule out obvious non-receipts:
+ *   - Frame-hugging quads (the entire photo)
+ *   - Dark-interior quads (receipts are printed on white/near-white stock)
  */
 object DocumentDetector {
 
     private const val TAG = "DocumentDetector"
 
-    /** Max side length for the working/analysis image. Detection runs here, but the
-     *  final perspective warp uses the original full-resolution Mat to keep quality. */
     private const val WORK_MAX_SIDE = 1600
-
-    /** Reject contours with area below this fraction of the full frame. Filters UI
-     *  clutter, stray specks, and tiny printed artifacts. */
     private const val MIN_AREA_FRACTION = 0.01
+    private const val MAX_AREA_FRACTION = 0.55
+    private const val FRAME_MARGIN_PX = 40
 
-    /** Reject contours that cover most of the frame — those are almost certainly
-     *  the whole surface, not an individual document. */
-    private const val MAX_AREA_FRACTION = 0.90
+    /** Minimum mean luma (0–255) for the interior of a detection to count as
+     *  receipt-like. Tuned so cream/pink thermal paper still passes. */
+    private const val MIN_WHITE_LUMA = 150.0
 
-    data class Detection(
-        /** Corners in the original (full-resolution) image coordinate space. */
+    /** Maximum chroma (max-min channel spread) for the interior to still
+     *  count as near-neutral. A bright-red folder, for instance, would score
+     *  high luma but huge chroma and get rejected here. */
+    private const val MAX_WHITE_CHROMA = 70.0
+
+    data class Quad(
+        val id: Long,
+        /** TL, TR, BR, BL in original-image pixel space. */
         val corners: List<Point>,
-        val areaPx: Double,
-    )
+    ) {
+        fun boundsWidth(): Double = corners.maxOf { it.x } - corners.minOf { it.x }
+        fun boundsHeight(): Double = corners.maxOf { it.y } - corners.minOf { it.y }
+    }
 
-    /** Full pipeline: find docs, warp each, return bitmaps in reading order. */
-    fun detectAndExtract(source: Bitmap): List<Bitmap> {
+    fun detect(source: Bitmap): List<Quad> {
         val full = Mat().also { Utils.bitmapToMat(source, it) }
         try {
-            val detections = findDocuments(full)
-            Log.i(TAG, "Detected ${detections.size} document(s)")
-            return detections.map { warpDocument(full, it.corners) }
+            return findDocuments(full, source.width, source.height)
         } finally {
             full.release()
         }
     }
 
-    private fun findDocuments(full: Mat): List<Detection> {
+    fun warp(source: Bitmap, quad: Quad): Bitmap {
+        val full = Mat().also { Utils.bitmapToMat(source, it) }
+        try {
+            return warpDocument(full, quad.corners)
+        } finally {
+            full.release()
+        }
+    }
+
+    /**
+     * Tap-to-add: grow a document-shaped region from a user-tapped seed pixel
+     * by flood-filling in pixels whose color is close to the seed's. Returns
+     * null when nothing receipt-like can be grown; the caller should then
+     * fall back to a placeholder rectangle.
+     */
+    fun growFromSeed(source: Bitmap, seedX: Double, seedY: Double, nextId: Long): Quad? {
+        val full = Mat().also { Utils.bitmapToMat(source, it) }
+        val work = Mat()
+        val scale = scaleToWorking(full, work)
+        try {
+            val workW = work.cols(); val workH = work.rows()
+            val workX = (seedX * scale).toInt().coerceIn(0, workW - 1)
+            val workY = (seedY * scale).toInt().coerceIn(0, workH - 1)
+
+            val bgr = Mat()
+            Imgproc.cvtColor(work, bgr, Imgproc.COLOR_RGBA2BGR)
+
+            // floodFill with FLOODFILL_MASK_ONLY writes the connected region
+            // into `mask` without modifying `bgr`. `mask` must be H+2 × W+2.
+            val mask = Mat.zeros(workH + 2, workW + 2, CvType.CV_8UC1)
+            val loDiff = Scalar(12.0, 12.0, 12.0)
+            val upDiff = Scalar(12.0, 12.0, 12.0)
+            val flags = 4 or (255 shl 8) or
+                Imgproc.FLOODFILL_FIXED_RANGE or Imgproc.FLOODFILL_MASK_ONLY
+
+            Imgproc.floodFill(
+                bgr, mask, Point(workX.toDouble(), workY.toDouble()),
+                Scalar(255.0, 255.0, 255.0), Rect(), loDiff, upDiff, flags,
+            )
+
+            // Clean the mask a bit so small gaps inside the region (printed
+            // text) don't poke holes through the final contour.
+            val maskROI = mask.submat(Rect(1, 1, workW, workH)).clone()
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+            Imgproc.morphologyEx(maskROI, maskROI, Imgproc.MORPH_CLOSE, kernel, Point(-1.0, -1.0), 2)
+
+            val contours = mutableListOf<MatOfPoint>()
+            Imgproc.findContours(
+                maskROI, contours, Mat(),
+                Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE,
+            )
+
+            mask.release(); maskROI.release(); kernel.release(); bgr.release()
+
+            val minArea = workW * workH * 0.005
+            val seedPointWork = Point(workX.toDouble(), workY.toDouble())
+
+            val containing = contours.filter { c ->
+                val poly = MatOfPoint2f(*c.toArray())
+                Imgproc.contourArea(c) > minArea &&
+                    Imgproc.pointPolygonTest(poly, seedPointWork, false) >= 0
+            }.maxByOrNull { Imgproc.contourArea(it) } ?: return null
+
+            val hull = MatOfPoint2f(*containing.toArray())
+            val peri = Imgproc.arcLength(hull, true)
+            val approx = MatOfPoint2f()
+            Imgproc.approxPolyDP(hull, approx, 0.02 * peri, true)
+
+            val cornersUsed: Array<Point> = if (approx.toArray().size == 4) {
+                approx.toArray()
+            } else {
+                val rect = Imgproc.minAreaRect(hull)
+                Array(4) { Point() }.also { rect.points(it) }
+            }
+            if (!isPlausibleQuad(cornersUsed)) return null
+
+            val ordered = orderCorners(cornersUsed)
+            val scaledBack = ordered.map { Point(it.x / scale, it.y / scale) }
+            return Quad(id = nextId, corners = scaledBack)
+        } finally {
+            full.release(); work.release()
+        }
+    }
+
+    private fun findDocuments(full: Mat, imgW: Int, imgH: Int): List<Quad> {
         val work = Mat()
         val scale = scaleToWorking(full, work)
 
         val gray = Mat()
         Imgproc.cvtColor(work, gray, Imgproc.COLOR_RGBA2GRAY)
 
-        // Slight blur to kill print noise without blowing out paper edges.
         val blurred = Mat()
         Imgproc.GaussianBlur(gray, blurred, Size(5.0, 5.0), 0.0)
 
-        // Canny params tuned for white paper against a varied surface. Tight
-        // enough to reject shadows, loose enough to keep the full receipt border.
         val edges = Mat()
         Imgproc.Canny(blurred, edges, 40.0, 120.0)
 
-        // Close small gaps in the edge map so a slightly broken receipt border
-        // still yields a closed contour.
         val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
         Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel, Point(-1.0, -1.0), 2)
 
@@ -80,11 +166,12 @@ object DocumentDetector {
             Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE,
         )
 
-        val totalArea = work.size().area()
+        val totalArea = work.size().width * work.size().height
         val minArea = totalArea * MIN_AREA_FRACTION
         val maxArea = totalArea * MAX_AREA_FRACTION
 
-        val candidates = mutableListOf<Detection>()
+        val candidates = mutableListOf<Quad>()
+        var nextId = 1L
 
         for (c in contours) {
             val area = Imgproc.contourArea(c)
@@ -96,23 +183,21 @@ object DocumentDetector {
             Imgproc.approxPolyDP(hull, approx, 0.02 * peri, true)
 
             val corners = approx.toArray()
-            val cornersUsed: Array<Point> = if (corners.size == 4) {
-                corners
-            } else {
-                // Fallback: use min-area rect. Useful for receipts whose long
-                // edge is slightly curved and fails the 4-point simplification.
+            val cornersUsed: Array<Point> = if (corners.size == 4) corners else {
                 val rect = Imgproc.minAreaRect(hull)
-                val pts = Array(4) { Point() }
-                rect.points(pts)
-                if (rect.size.area() < minArea) continue
-                pts
+                if (rect.size.width * rect.size.height < minArea) continue
+                Array(4) { Point() }.also { rect.points(it) }
             }
 
             if (!isPlausibleQuad(cornersUsed)) continue
 
             val ordered = orderCorners(cornersUsed)
             val scaledBack = ordered.map { Point(it.x / scale, it.y / scale) }
-            candidates += Detection(scaledBack, area / (scale * scale))
+
+            if (isFullFrame(scaledBack, imgW, imgH)) continue
+            if (!hasLightInterior(full, scaledBack)) continue
+
+            candidates += Quad(id = nextId++, corners = scaledBack)
         }
 
         gray.release(); blurred.release(); edges.release(); kernel.release(); work.release()
@@ -120,17 +205,72 @@ object DocumentDetector {
         return deduplicate(candidates).sortedWith(readingOrder())
     }
 
-    /** Reading order: top-to-bottom, then left-to-right, using quadrant bands
-     *  so a slightly-higher receipt doesn't jump the row. */
-    private fun readingOrder(): Comparator<Detection> = Comparator { a, b ->
+    /**
+     * Samples a 3×3 grid of patches inside the quad's bounding box and requires
+     * the median patch to be bright and near-neutral. This rejects dark
+     * surfaces (table, book cover) while tolerating cream/pink receipt stock
+     * and the ink used for print.
+     */
+    private fun hasLightInterior(full: Mat, corners: List<Point>): Boolean {
+        val minX = corners.minOf { it.x }; val maxX = corners.maxOf { it.x }
+        val minY = corners.minOf { it.y }; val maxY = corners.maxOf { it.y }
+        val w = (maxX - minX); val h = (maxY - minY)
+        if (w < 20 || h < 20) return false
+
+        // Shrink the sampling window a touch so edges (which may include the
+        // table color just outside a rotated receipt) don't pollute the mean.
+        val insetX = w * 0.1; val insetY = h * 0.1
+        val roiX = (minX + insetX).toInt().coerceIn(0, full.cols() - 1)
+        val roiY = (minY + insetY).toInt().coerceIn(0, full.rows() - 1)
+        val roiW = (w - 2 * insetX).toInt().coerceAtLeast(30)
+            .coerceAtMost(full.cols() - roiX)
+        val roiH = (h - 2 * insetY).toInt().coerceAtLeast(30)
+            .coerceAtMost(full.rows() - roiY)
+
+        if (roiW < 30 || roiH < 30) return false
+
+        val lumas = mutableListOf<Double>()
+        val chromas = mutableListOf<Double>()
+        val patch = 20
+        for (row in 0..2) for (col in 0..2) {
+            val px = roiX + (col + 1) * roiW / 4 - patch / 2
+            val py = roiY + (row + 1) * roiH / 4 - patch / 2
+            val pxC = px.coerceIn(0, full.cols() - patch - 1)
+            val pyC = py.coerceIn(0, full.rows() - patch - 1)
+            val sample = full.submat(Rect(pxC, pyC, patch, patch))
+            val mean = Core.mean(sample)
+            val r = mean.`val`[0]; val g = mean.`val`[1]; val b = mean.`val`[2]
+            lumas += 0.299 * r + 0.587 * g + 0.114 * b
+            chromas += maxOf(r, g, b) - minOf(r, g, b)
+            sample.release()
+        }
+        lumas.sort(); chromas.sort()
+        val medianLuma = lumas[4]
+        val medianChroma = chromas[4]
+        val ok = medianLuma >= MIN_WHITE_LUMA && medianChroma <= MAX_WHITE_CHROMA
+        if (!ok) Log.v(TAG, "Rejected quad: luma=$medianLuma chroma=$medianChroma")
+        return ok
+    }
+
+    private fun isFullFrame(corners: List<Point>, imgW: Int, imgH: Int): Boolean {
+        val minX = corners.minOf { it.x }
+        val maxX = corners.maxOf { it.x }
+        val minY = corners.minOf { it.y }
+        val maxY = corners.maxOf { it.y }
+        return minX < FRAME_MARGIN_PX &&
+            minY < FRAME_MARGIN_PX &&
+            maxX > imgW - FRAME_MARGIN_PX &&
+            maxY > imgH - FRAME_MARGIN_PX
+    }
+
+    private fun readingOrder(): Comparator<Quad> = Comparator { a, b ->
         val ay = a.corners.minOf { it.y }
         val by = b.corners.minOf { it.y }
-        val rowTol = 200.0 // pixels — receipts more than this apart are different rows
+        val rowTol = 200.0
         if (kotlin.math.abs(ay - by) > rowTol) ay.compareTo(by)
         else a.corners.minOf { it.x }.compareTo(b.corners.minOf { it.x })
     }
 
-    /** Warp a quadrilateral region to an upright rectangle at native resolution. */
     private fun warpDocument(full: Mat, corners: List<Point>): Bitmap {
         val src = MatOfPoint2f(*corners.toTypedArray())
 
@@ -156,7 +296,6 @@ object DocumentDetector {
             Imgproc.INTER_CUBIC, Core.BORDER_REPLICATE, Scalar(0.0),
         )
 
-        // Mild unsharp mask improves OCR on receipts without going nuclear.
         val sharpened = unsharpMask(warped)
         warped.release(); transform.release(); src.release(); dst.release()
 
@@ -195,19 +334,12 @@ object DocumentDetector {
         return kotlin.math.sqrt(dx * dx + dy * dy)
     }
 
-    /** Order 4 points as: top-left, top-right, bottom-right, bottom-left. */
     private fun orderCorners(pts: Array<Point>): List<Point> {
-        val sorted = pts.sortedBy { it.x + it.y }
-        val tl = sorted.first()
-        val br = sorted.last()
-        val diagSorted = pts.sortedBy { it.x - it.y }
-        val bl = diagSorted.first()
-        val tr = diagSorted.last()
-        return listOf(tl, tr, br, bl)
+        val bySum = pts.sortedBy { it.x + it.y }
+        val byDiag = pts.sortedBy { it.x - it.y }
+        return listOf(bySum.first(), byDiag.last(), bySum.last(), byDiag.first())
     }
 
-    /** Reject shapes that couldn't be a receipt: too thin, non-convex, bad
-     *  aspect. Receipts are typically 1:2 — 1:6 but we allow 1:10 for safety. */
     private fun isPlausibleQuad(pts: Array<Point>): Boolean {
         if (pts.size != 4) return false
         val ordered = orderCorners(pts)
@@ -218,10 +350,11 @@ object DocumentDetector {
         return aspect in 1.0..12.0
     }
 
-    /** Remove detections whose bounding boxes overlap heavily. Keeps the larger. */
-    private fun deduplicate(input: List<Detection>): List<Detection> {
-        val sorted = input.sortedByDescending { it.areaPx }
-        val kept = mutableListOf<Detection>()
+    private fun deduplicate(input: List<Quad>): List<Quad> {
+        val sorted = input.sortedByDescending {
+            val w = it.boundsWidth(); val h = it.boundsHeight(); w * h
+        }
+        val kept = mutableListOf<Quad>()
         for (d in sorted) {
             val r = boundingRect(d.corners)
             val overlaps = kept.any { iou(r, boundingRect(it.corners)) > 0.3 }
@@ -246,5 +379,3 @@ object DocumentDetector {
         return if (union <= 0) 0.0 else inter.toDouble() / union
     }
 }
-
-private fun Size.area(): Double = width * height

@@ -14,27 +14,37 @@ import java.time.LocalDate
 import java.util.Locale
 
 /**
- * Writes a cropped receipt bitmap into the shared Pictures/ReceiptSnap/ collection
- * via MediaStore. Filenames follow `{yyyy-MM-dd}_{Merchant}.jpg` when both are
- * available, with graceful degradation, and are always made unique against the
- * existing set so nothing is ever overwritten.
+ * Saves a cropped receipt bitmap to Pictures/ReceiptSnap/ via MediaStore.
+ *
+ * Naming contract:
+ *  - Base is joined from any of date / location / "meal", in that order,
+ *    separated by underscores. Examples:
+ *      date + loc + meal → `2026-04-23_Seattle_meal.jpg`
+ *      date + meal        → `2026-04-23_meal.jpg`
+ *      loc only           → `Seattle.jpg`
+ *      meal only          → `meal - {N}.jpg` (always numbered)
+ *  - When nothing identifiable is extracted → `receipt - {N}.jpg` (numbered).
+ *  - On collision with an existing MediaStore entry we append ` (2)`, ` (3)`, …
+ *    to the base rather than overwriting.
  */
 object ReceiptStorage {
 
     private const val RELATIVE_DIR = "Pictures/ReceiptSnap"
     private const val FALLBACK_BASE = "receipt"
+    private const val MEAL_ONLY_BASE = "meal"
 
     data class SaveResult(val uri: Uri, val displayName: String)
 
     suspend fun save(
         context: Context,
         bitmap: Bitmap,
-        merchant: String?,
         date: LocalDate?,
+        location: String?,
+        isMeal: Boolean,
     ): SaveResult {
         val resolver = context.contentResolver
-        val baseName = buildBaseName(merchant, date)
-        val uniqueName = allocateUniqueName(resolver, baseName, merchant, date)
+        val baseName = buildBaseName(date, location, isMeal)
+        val uniqueName = allocateUniqueName(resolver, baseName, date, location, isMeal)
 
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "$uniqueName.jpg")
@@ -63,9 +73,8 @@ object ReceiptStorage {
             ?: error("MediaStore insert returned null")
 
         try {
-            resolver.openOutputStream(uri)?.use { out ->
-                writeJpeg(bitmap, out)
-            } ?: error("Could not open output stream for $uri")
+            resolver.openOutputStream(uri)?.use { out -> writeJpeg(bitmap, out) }
+                ?: error("Could not open output stream for $uri")
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val finalize = ContentValues().apply {
@@ -82,36 +91,36 @@ object ReceiptStorage {
     }
 
     private fun writeJpeg(bitmap: Bitmap, out: OutputStream) {
-        // 95% is the sweet spot: near-lossless visually while keeping multi-MB
-        // receipts comfortably under 10MB even at 200MP pipeline output.
         bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
         out.flush()
     }
 
-    private fun buildBaseName(merchant: String?, date: LocalDate?): String {
-        val sanitizedMerchant = merchant?.let(::sanitize)?.takeIf { it.isNotBlank() }
+    private fun buildBaseName(date: LocalDate?, location: String?, isMeal: Boolean): String {
+        val sanitizedLoc = location?.let(::sanitize)?.takeIf { it.isNotBlank() }
         val dateStr = date?.let(ReceiptParser::formatDateForFilename)
+        val parts = mutableListOf<String>()
+        if (dateStr != null) parts += dateStr
+        if (sanitizedLoc != null) parts += sanitizedLoc
+        if (isMeal) parts += "meal"
         return when {
-            dateStr != null && sanitizedMerchant != null -> "${dateStr}_$sanitizedMerchant"
-            dateStr != null -> dateStr
-            sanitizedMerchant != null -> sanitizedMerchant
-            else -> FALLBACK_BASE
+            parts.isEmpty() -> FALLBACK_BASE
+            parts.size == 1 && parts[0] == "meal" -> MEAL_ONLY_BASE
+            else -> parts.joinToString("_")
         }
     }
 
-    /** Pick a filename not already present in Pictures/ReceiptSnap/. We check
-     *  MediaStore and always append a " - N" suffix for the fallback branch
-     *  per the product spec; for the regular branch, we only add " (N)" if a
-     *  collision actually exists. */
     private fun allocateUniqueName(
         resolver: ContentResolver,
         base: String,
-        merchant: String?,
         date: LocalDate?,
+        location: String?,
+        isMeal: Boolean,
     ): String {
-        val isFallback = merchant == null && date == null
-        if (isFallback) {
-            // Spec: "receipt - 1", "receipt - 2", ... always numbered.
+        // When the only identifying fact is that it's a meal (or nothing at
+        // all), always number. Multiple anonymous meals in a row would
+        // otherwise have to pile up as "meal (2)", "meal (3)" which is ugly.
+        val alwaysNumber = (date == null && location == null)
+        if (alwaysNumber) {
             var n = 1
             while (true) {
                 val candidate = "$base - $n"
@@ -143,7 +152,6 @@ object ReceiptStorage {
         } ?: false
     }
 
-    /** Filesystem-safe filename fragment. */
     private fun sanitize(raw: String): String {
         val trimmed = raw.trim().take(48)
         val stripped = trimmed.replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1F]"), "")
