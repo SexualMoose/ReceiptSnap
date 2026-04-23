@@ -1,27 +1,32 @@
 package com.tyler.receiptsnap.data
 
 import android.content.Context
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
+import java.util.UUID
 
 /**
- * App settings — the company's Coupa host and the user's work email.
- * Persisted to SharedPreferences. Each field is exposed as a StateFlow so
- * Compose screens recompose when the user edits a field elsewhere.
+ * App settings — Coupa host + work email (for receipt-address derivation)
+ * plus a list of saved outbound SMTP accounts with one flagged active. The
+ * send loop always uses the active account's credentials; the user can
+ * switch via the Settings screen whenever one account bumps up against
+ * its provider's send limits.
  *
- * The Coupa wallet ingest address is derived by convention:
- *   "{FirstName}{LastName}@{instance}.coupa-expenses.com"
- * where `instance` is the first dotted segment of the host and the name is
- * built from the local-part of the user email (split on . _ -).
- * The user can override the full address via [walletOverride] when their
- * deployment doesn't follow the convention.
+ * Backwards compatibility: an older build stored a single SMTP account in
+ * separate pref keys. On first launch of this version we migrate those
+ * into an SmtpAccount entry so nothing is lost.
  */
 class SettingsStore(context: Context) {
 
     private val prefs = context.applicationContext
         .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+
+    // --- Coupa identity -----------------------------------------------------
 
     private val _companyHost = MutableStateFlow(prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST)
     val companyHost: StateFlow<String> = _companyHost.asStateFlow()
@@ -29,78 +34,45 @@ class SettingsStore(context: Context) {
     private val _userEmail = MutableStateFlow(prefs.getString(KEY_EMAIL, DEFAULT_EMAIL) ?: DEFAULT_EMAIL)
     val userEmail: StateFlow<String> = _userEmail.asStateFlow()
 
-    /** The mailbox that actually sends the email — separate from the "Coupa
-     *  identity" email. Lets the user send from a personal Gmail / Outlook
-     *  account via SMTP while Coupa still attributes the receipt to the
-     *  work email (because Coupa's recipient address encodes it). */
-    private val _senderEmail = MutableStateFlow(prefs.getString(KEY_SENDER, "") ?: "")
-    val senderEmail: StateFlow<String> = _senderEmail.asStateFlow()
-
     private val _walletOverride = MutableStateFlow(prefs.getString(KEY_OVERRIDE, "") ?: "")
     val walletOverride: StateFlow<String> = _walletOverride.asStateFlow()
 
-    private val _smtpHost = MutableStateFlow(prefs.getString(KEY_SMTP_HOST, DEFAULT_SMTP_HOST) ?: DEFAULT_SMTP_HOST)
+    // --- Account list -------------------------------------------------------
+
+    private val _accounts = MutableStateFlow(loadAccountsWithMigration())
+    val accounts: StateFlow<List<SmtpAccount>> = _accounts.asStateFlow()
+
+    private val _activeAccountId = MutableStateFlow(
+        prefs.getString(KEY_ACTIVE_ID, null) ?: _accounts.value.firstOrNull()?.id
+    )
+    val activeAccountId: StateFlow<String?> = _activeAccountId.asStateFlow()
+
+    // Derived per-field flows still exist because downstream code (send
+    // loop, PDF maker, SmtpSender) was written against them. They always
+    // reflect the currently-active account.
+    private val _smtpHost = MutableStateFlow(activeAccountOrNull()?.host ?: DEFAULT_SMTP_HOST)
     val smtpHost: StateFlow<String> = _smtpHost.asStateFlow()
 
-    private val _smtpPort = MutableStateFlow(prefs.getInt(KEY_SMTP_PORT, DEFAULT_SMTP_PORT))
+    private val _smtpPort = MutableStateFlow(activeAccountOrNull()?.port ?: DEFAULT_SMTP_PORT)
     val smtpPort: StateFlow<Int> = _smtpPort.asStateFlow()
 
-    private val _smtpPassword = MutableStateFlow(prefs.getString(KEY_SMTP_PASSWORD, "") ?: "")
+    private val _smtpPassword = MutableStateFlow(activeAccountOrNull()?.password ?: "")
     val smtpPassword: StateFlow<String> = _smtpPassword.asStateFlow()
 
-    /** Derived (or overridden) wallet address to send receipts to. */
-    fun currentWalletEmail(): String {
-        val override = _walletOverride.value.trim()
-        if (override.isNotBlank()) return override
-        return deriveCoupaAddress(_userEmail.value, _companyHost.value)
+    private val _senderEmail = MutableStateFlow(activeAccountOrNull()?.email ?: "")
+    val senderEmail: StateFlow<String> = _senderEmail.asStateFlow()
+
+    init {
+        // Make sure the mirrored flows match the initial active account.
+        syncMirrorsFromActive()
+        // If we migrated but no KEY_ACTIVE_ID was stored, persist the
+        // freshly-selected active ID so next launch skips the fallback.
+        if (prefs.getString(KEY_ACTIVE_ID, null) == null && _activeAccountId.value != null) {
+            prefs.edit().putString(KEY_ACTIVE_ID, _activeAccountId.value).apply()
+        }
     }
 
-    /** Address used as the From on SMTP and as the SMTP login. Defaults to
-     *  the user's Coupa-identity email if the sender field is blank. */
-    fun currentSenderEmail(): String {
-        val s = _senderEmail.value.trim()
-        return s.ifBlank { _userEmail.value.trim() }
-    }
-
-    fun setSenderEmail(value: String) {
-        val v = value.trim()
-        prefs.edit().putString(KEY_SENDER, v).apply()
-        _senderEmail.value = v
-    }
-
-    /**
-     * Reset every stored field back to the out-of-the-box defaults. Used by
-     * the "Restore defaults" button in Settings. Note that this also clears
-     * the SMTP password since its default is empty.
-     */
-    fun restoreDefaults() {
-        prefs.edit().clear().apply()
-        _companyHost.value = DEFAULT_HOST
-        _userEmail.value = DEFAULT_EMAIL
-        _senderEmail.value = ""
-        _walletOverride.value = ""
-        _smtpHost.value = DEFAULT_SMTP_HOST
-        _smtpPort.value = DEFAULT_SMTP_PORT
-        _smtpPassword.value = ""
-    }
-
-    fun setSmtpHost(value: String) {
-        val v = value.trim()
-        prefs.edit().putString(KEY_SMTP_HOST, v).apply()
-        _smtpHost.value = v
-    }
-
-    fun setSmtpPort(value: Int) {
-        prefs.edit().putInt(KEY_SMTP_PORT, value).apply()
-        _smtpPort.value = value
-    }
-
-    fun setSmtpPassword(value: String) {
-        // Not trimmed — some passwords legitimately contain leading/trailing
-        // whitespace, and app passwords sometimes include spaces.
-        prefs.edit().putString(KEY_SMTP_PASSWORD, value).apply()
-        _smtpPassword.value = value
-    }
+    // --- Coupa-identity mutators --------------------------------------------
 
     fun setCompanyHost(value: String) {
         val v = value.trim()
@@ -120,24 +92,180 @@ class SettingsStore(context: Context) {
         _walletOverride.value = v
     }
 
+    /** Derived (or overridden) wallet address to send receipts to. */
+    fun currentWalletEmail(): String {
+        val override = _walletOverride.value.trim()
+        if (override.isNotBlank()) return override
+        return deriveCoupaAddress(_userEmail.value, _companyHost.value)
+    }
+
+    /** SMTP From / login — pulled from the active saved account. */
+    fun currentSenderEmail(): String =
+        activeAccountOrNull()?.email?.takeIf { it.isNotBlank() } ?: _userEmail.value.trim()
+
+    // --- Account list API ---------------------------------------------------
+
+    fun activeAccountOrNull(): SmtpAccount? {
+        val id = _activeAccountId.value
+        val list = _accounts.value
+        return list.firstOrNull { it.id == id } ?: list.firstOrNull()
+    }
+
+    /** Add (or update by id) an account. Newly-added accounts become
+     *  active when there was no active account before. */
+    fun upsertAccount(account: SmtpAccount) {
+        val list = _accounts.value.toMutableList()
+        val idx = list.indexOfFirst { it.id == account.id }
+        if (idx >= 0) list[idx] = account else list += account
+        _accounts.value = list
+        persistAccounts()
+        if (_activeAccountId.value == null) setActiveAccount(account.id)
+        else if (_activeAccountId.value == account.id) syncMirrorsFromActive()
+    }
+
+    fun removeAccount(id: String) {
+        val list = _accounts.value.filterNot { it.id == id }
+        _accounts.value = list
+        persistAccounts()
+        if (_activeAccountId.value == id) {
+            val next = list.firstOrNull()?.id
+            _activeAccountId.value = next
+            prefs.edit().putString(KEY_ACTIVE_ID, next).apply()
+            syncMirrorsFromActive()
+        }
+    }
+
+    fun setActiveAccount(id: String) {
+        if (_accounts.value.none { it.id == id }) return
+        _activeAccountId.value = id
+        prefs.edit().putString(KEY_ACTIVE_ID, id).apply()
+        syncMirrorsFromActive()
+    }
+
+    // --- Per-field mutators (operate on the active account) ----------------
+
+    fun setSmtpHost(value: String) = mutateActive { it.copy(host = value.trim()) }
+    fun setSmtpPort(value: Int) = mutateActive { it.copy(port = value) }
+    fun setSmtpPassword(value: String) = mutateActive { it.copy(password = value) }
+    fun setSenderEmail(value: String) = mutateActive { it.copy(email = value.trim()) }
+
+    private inline fun mutateActive(transform: (SmtpAccount) -> SmtpAccount) {
+        val active = activeAccountOrNull()
+        if (active != null) {
+            upsertAccount(transform(active))
+        } else {
+            // No accounts yet — create one from a clean defaults object and
+            // apply the mutation. Lets the user build up their first
+            // account by filling fields one at a time.
+            val fresh = transform(
+                SmtpAccount(
+                    email = _userEmail.value.trim(),
+                    password = "",
+                    host = DEFAULT_SMTP_HOST,
+                    port = DEFAULT_SMTP_PORT,
+                )
+            )
+            upsertAccount(fresh)
+        }
+    }
+
+    fun restoreDefaults() {
+        prefs.edit().clear().apply()
+        _companyHost.value = DEFAULT_HOST
+        _userEmail.value = DEFAULT_EMAIL
+        _walletOverride.value = ""
+        _accounts.value = emptyList()
+        _activeAccountId.value = null
+        syncMirrorsFromActive()
+    }
+
+    // --- Internals ----------------------------------------------------------
+
+    private fun syncMirrorsFromActive() {
+        val a = activeAccountOrNull()
+        _smtpHost.value = a?.host ?: DEFAULT_SMTP_HOST
+        _smtpPort.value = a?.port ?: DEFAULT_SMTP_PORT
+        _smtpPassword.value = a?.password ?: ""
+        _senderEmail.value = a?.email ?: ""
+    }
+
+    private fun persistAccounts() {
+        val arr = JSONArray()
+        for (a in _accounts.value) {
+            arr.put(JSONObject().apply {
+                put("id", a.id)
+                put("email", a.email)
+                put("password", a.password)
+                put("host", a.host)
+                put("port", a.port)
+            })
+        }
+        prefs.edit().putString(KEY_ACCOUNTS, arr.toString()).apply()
+    }
+
+    /** Load accounts from the JSON pref, falling back to a one-shot
+     *  migration from the legacy single-account pref keys. */
+    private fun loadAccountsWithMigration(): List<SmtpAccount> {
+        val json = prefs.getString(KEY_ACCOUNTS, null)
+        if (!json.isNullOrBlank()) {
+            runCatching { parseAccounts(json) }
+                .onSuccess { return it }
+                .onFailure { Log.e(TAG, "accounts JSON parse failed; falling back", it) }
+        }
+        // Legacy single-account prefs — migrate into one SmtpAccount if
+        // they held anything useful.
+        val legacyEmail = prefs.getString("sender_email", "") ?: ""
+        val legacyPassword = prefs.getString("smtp_password", "") ?: ""
+        val legacyHost = prefs.getString("smtp_host", DEFAULT_SMTP_HOST) ?: DEFAULT_SMTP_HOST
+        val legacyPort = prefs.getInt("smtp_port", DEFAULT_SMTP_PORT)
+        val candidateEmail = legacyEmail.ifBlank { prefs.getString(KEY_EMAIL, DEFAULT_EMAIL) ?: DEFAULT_EMAIL }
+        if (legacyPassword.isBlank() && legacyEmail.isBlank()) return emptyList()
+        val migrated = SmtpAccount(
+            id = UUID.randomUUID().toString(),
+            email = candidateEmail,
+            password = legacyPassword,
+            host = legacyHost,
+            port = legacyPort,
+        )
+        prefs.edit()
+            .putString(KEY_ACCOUNTS, JSONArray().apply { put(toJson(migrated)) }.toString())
+            .putString(KEY_ACTIVE_ID, migrated.id)
+            .apply()
+        Log.i(TAG, "Migrated legacy SMTP prefs into SmtpAccount ${migrated.id}")
+        return listOf(migrated)
+    }
+
+    private fun parseAccounts(json: String): List<SmtpAccount> {
+        val arr = JSONArray(json)
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            SmtpAccount(
+                id = o.optString("id", UUID.randomUUID().toString()),
+                email = o.optString("email", ""),
+                password = o.optString("password", ""),
+                host = o.optString("host", DEFAULT_SMTP_HOST),
+                port = o.optInt("port", DEFAULT_SMTP_PORT),
+            )
+        }
+    }
+
+    private fun toJson(a: SmtpAccount): JSONObject = JSONObject().apply {
+        put("id", a.id); put("email", a.email); put("password", a.password)
+        put("host", a.host); put("port", a.port)
+    }
+
     companion object {
+        private const val TAG = "SettingsStore"
+
         private const val PREF_NAME = "receipt_snap_settings"
         private const val KEY_HOST = "company_host"
         private const val KEY_EMAIL = "user_email"
-        private const val KEY_SENDER = "sender_email"
         private const val KEY_OVERRIDE = "coupa_wallet_override"
-        private const val KEY_SMTP_HOST = "smtp_host"
-        private const val KEY_SMTP_PORT = "smtp_port"
-        private const val KEY_SMTP_PASSWORD = "smtp_password"
+        private const val KEY_ACCOUNTS = "smtp_accounts_json"
+        private const val KEY_ACTIVE_ID = "smtp_active_account_id"
 
-        // Pre-seeded so the app sends correctly on first run without a detour
-        // through Settings. User can change anytime.
         private const val DEFAULT_HOST = "bdpinternational.coupahost.com"
         private const val DEFAULT_EMAIL = "Tyler.Keller@psabdp.com"
-
-        // Office 365 is BDP's likely mail provider. 587 is the STARTTLS
-        // submission port. If the tenant has disabled basic-auth SMTP the
-        // user will need an app password or a different host.
         private const val DEFAULT_SMTP_HOST = "smtp.office365.com"
         private const val DEFAULT_SMTP_PORT = 587
 

@@ -1,7 +1,11 @@
 package com.tyler.receiptsnap.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -144,21 +148,21 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         }
 
         Section(title = "Outgoing Email (SMTP)") {
+            AccountSwitcher(settings)
+
+            Spacer(Modifier.height(4.dp))
+
+            Text(
+                text = "Editing active account:",
+                color = Color.White.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.bodySmall,
+            )
             DarkOutlinedField(
                 value = sender,
                 onValueChange = settings::setSenderEmail,
                 label = "Sender email (SMTP From + login)",
                 placeholder = email.ifBlank { "you@example.com" },
             )
-            Text(
-                text = "Defaults to your Coupa identity email when left blank. " +
-                    "Coupa identifies the receipt by the TO address regardless of " +
-                    "what sends it, so you can safely send from any mailbox here " +
-                    "(e.g. a personal Gmail).",
-                color = Color.White.copy(alpha = 0.55f),
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Spacer(Modifier.height(4.dp))
             DarkOutlinedField(
                 value = smtpHost,
                 onValueChange = settings::setSmtpHost,
@@ -180,32 +184,117 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
                 isPassword = true,
             )
             GmailHelpCard()
-            Button(
-                onClick = {
-                    settings.setSmtpHost("smtp.gmail.com")
-                    settings.setSmtpPort(587)
-                },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF1A1A1A),
-                    contentColor = MaterialTheme.colorScheme.primary,
-                ),
-            ) {
-                Text("Use Gmail defaults (smtp.gmail.com:587)")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        settings.setSmtpHost("smtp.gmail.com")
+                        settings.setSmtpPort(587)
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("Gmail defaults", color = MaterialTheme.colorScheme.primary) }
+                OutlinedButton(
+                    onClick = {
+                        settings.setSmtpHost("smtp.office365.com")
+                        settings.setSmtpPort(587)
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("O365 defaults", color = MaterialTheme.colorScheme.primary) }
             }
-            Button(
-                onClick = {
-                    settings.setSmtpHost("smtp.office365.com")
-                    settings.setSmtpPort(587)
-                },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF1A1A1A),
-                    contentColor = MaterialTheme.colorScheme.primary,
-                ),
+        }
+    }
+}
+
+/**
+ * List of saved SMTP accounts with radio-style select for the active one,
+ * plus Add and Delete controls. The currently-active account's credentials
+ * are what the send loop uses, so switching is the mechanism the user has
+ * for rotating off a provider that's hitting a daily cap.
+ */
+@Composable
+private fun AccountSwitcher(settings: com.tyler.receiptsnap.data.SettingsStore) {
+    val accounts by settings.accounts.collectAsState()
+    val activeId by settings.activeAccountId.collectAsState()
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (accounts.isEmpty()) {
+            Text(
+                text = "No saved accounts yet — fill the fields below to create one.",
+                color = Color.White.copy(alpha = 0.55f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        for (account in accounts) {
+            val isActive = account.id == activeId
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        if (isActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                        else Color(0xFF0A0A0A)
+                    )
+                    .clickable { settings.setActiveAccount(account.id) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
             ) {
-                Text("Use Office 365 defaults (smtp.office365.com:587)")
+                androidx.compose.material3.RadioButton(
+                    selected = isActive,
+                    onClick = { settings.setActiveAccount(account.id) },
+                    colors = androidx.compose.material3.RadioButtonDefaults.colors(
+                        selectedColor = MaterialTheme.colorScheme.primary,
+                        unselectedColor = Color.White.copy(alpha = 0.4f),
+                    ),
+                )
+                Spacer(Modifier.width(6.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = account.label,
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                    Text(
+                        text = account.hostAndPort +
+                            if (account.password.isBlank()) " · no password set" else "",
+                        color = Color.White.copy(alpha = 0.6f),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+                androidx.compose.material3.IconButton(
+                    onClick = { settings.removeAccount(account.id) },
+                ) {
+                    androidx.compose.material3.Icon(
+                        Icons.Default.Delete,
+                        contentDescription = "Remove account",
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
+        }
+
+        OutlinedButton(
+            onClick = {
+                // "Add new" creates a blank account and makes it active so
+                // the edit fields immediately point at it. User just fills
+                // them in.
+                val fresh = com.tyler.receiptsnap.data.SmtpAccount(
+                    host = "smtp.office365.com",
+                    port = 587,
+                )
+                settings.upsertAccount(fresh)
+                settings.setActiveAccount(fresh.id)
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("+ Add account", color = MaterialTheme.colorScheme.primary)
+        }
+
+        if (accounts.size > 1) {
+            Text(
+                text = "Tap a row to switch the active sender. Helpful when one " +
+                    "mailbox hits its daily SMTP limit — just switch to the next.",
+                color = Color.White.copy(alpha = 0.55f),
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

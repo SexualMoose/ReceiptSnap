@@ -77,16 +77,24 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 /** Concurrent SMTP workers. Each keeps one authenticated connection open
  *  for its share of the queue — so this also equals the number of auth
- *  attempts we make per batch. Stays well under Gmail/Office 365 limits. */
-private const val MAX_PARALLEL_SENDS = 4
+ *  attempts we make per batch. Stays well under Gmail (~10) and Office
+ *  365 (~20) per-account connection caps, with room on either side. */
+private const val MAX_PARALLEL_SENDS = 6
 
 /** Milliseconds between worker cold-starts. Prevents N simultaneous login
  *  attempts which can trigger anti-abuse throttling on Office 365. */
 private const val AUTH_STAGGER_MS = 250L
+
+/** Concurrent workers running DocumentDetector + ReceiptParser on picked
+ *  folder images. CPU-bound (OpenCV + ML Kit); 4 saturates a modern 8-core
+ *  Snapdragon without peaking bitmap memory past what largeHeap grants us. */
+private const val MAX_PARALLEL_PREPROCESS = 4
 
 data class LibraryItem(
     val uri: Uri,
@@ -416,8 +424,10 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             return@rememberLauncherForActivityResult
         }
 
-        // Branch 2 — detection pre-processing on IO. Progress reflected
-        // in the Library header via preprocessDone / preprocessTotal.
+        // Branch 2 — detection preprocessing, parallelized. Up to
+        // MAX_PARALLEL_PREPROCESS images get detect+warp+parse'd at once
+        // so a large folder isn't a serial wait. Progress is an atomic
+        // counter because workers complete in arbitrary order.
         scope.launch {
             // Wipe any leftover temp crops from a previous (possibly
             // crashed) session so the cache doesn't accumulate forever.
@@ -429,47 +439,65 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             preprocessTotal = imageFiles.size
             preprocessDone = 0
             preprocessLabel = "Analyzing images"
-            val queue = mutableListOf<LibraryItem>()
+
+            // Thread-safe accumulator. Workers append crops or move
+            // sources to the Failed archive under synchronized access.
+            val queue = java.util.Collections.synchronizedList(mutableListOf<LibraryItem>())
+            val doneCounter = java.util.concurrent.atomic.AtomicInteger(0)
+            val semaphore = Semaphore(MAX_PARALLEL_PREPROCESS)
             val now = System.currentTimeMillis() / 1000
 
-            for ((index, file) in imageFiles.withIndex()) {
-                preprocessDone = index
-                preprocessLabel = "Analyzing ${file.name}"
-                val srcUri = file.uri
-                val srcName = file.name ?: "receipt.jpg"
-                val result = withContext(Dispatchers.Default) {
-                    FolderUploadProcessor.process(context, srcUri)
-                }
-                when (result) {
-                    is FolderUploadProcessor.Result.Detected -> {
-                        for (crop in result.crops) {
-                            queue += LibraryItem(
-                                uri = Uri.fromFile(crop.tempFile),
-                                name = crop.displayName,
-                                dateAddedSec = now,
-                                moveAfterSend = true,
-                                sourceUri = srcUri,
-                                sourceName = srcName,
-                                pdfMaxWidthPx = PdfMaker.FOLDER_UPLOAD_MAX_WIDTH_PX,
-                            )
-                        }
-                    }
-                    is FolderUploadProcessor.Result.NoReceipts,
-                    is FolderUploadProcessor.Result.LoadFailed -> {
-                        withContext(Dispatchers.IO) {
-                            runCatching {
-                                CoupaUploadsFolder.moveToFailed(context, srcUri, srcName)
+            coroutineScope {
+                imageFiles.forEach { file ->
+                    launch(Dispatchers.Default) {
+                        semaphore.withPermit {
+                            val srcUri = file.uri
+                            val srcName = file.name ?: "receipt.jpg"
+                            val result = FolderUploadProcessor.process(context, srcUri)
+                            when (result) {
+                                is FolderUploadProcessor.Result.Detected -> {
+                                    for (crop in result.crops) {
+                                        queue.add(
+                                            LibraryItem(
+                                                uri = Uri.fromFile(crop.tempFile),
+                                                name = crop.displayName,
+                                                dateAddedSec = now,
+                                                moveAfterSend = true,
+                                                sourceUri = srcUri,
+                                                sourceName = srcName,
+                                                pdfMaxWidthPx = PdfMaker.FOLDER_UPLOAD_MAX_WIDTH_PX,
+                                            )
+                                        )
+                                    }
+                                }
+                                is FolderUploadProcessor.Result.NoReceipts,
+                                is FolderUploadProcessor.Result.LoadFailed -> {
+                                    withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            CoupaUploadsFolder.moveToFailed(context, srcUri, srcName)
+                                        }
+                                    }
+                                }
+                            }
+                            val n = doneCounter.incrementAndGet()
+                            withContext(Dispatchers.Main) {
+                                preprocessDone = n
+                                preprocessLabel = "Analyzing $n of ${imageFiles.size}"
                             }
                         }
                     }
                 }
             }
-            preprocessDone = imageFiles.size
+
             preprocessTotal = 0
             preprocessDone = 0
             preprocessLabel = null
 
-            if (queue.isEmpty()) {
+            // Snapshot the synchronized accumulator into a plain List
+            // before handing it to Compose state, to avoid downstream
+            // readers needing to hold the synchronization lock.
+            val finalQueue = synchronized(queue) { queue.toList() }
+            if (finalQueue.isEmpty()) {
                 Toast.makeText(
                     context,
                     "No receipts identified. Unrecognized images moved to " +
@@ -478,7 +506,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                 ).show()
                 return@launch
             }
-            sendQueue = queue
+            sendQueue = finalQueue
             runSendLoop()
         }
     }
