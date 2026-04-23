@@ -144,7 +144,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                     val config = SmtpSender.Config(
                         host = settings.smtpHost.value,
                         port = settings.smtpPort.value,
-                        fromEmail = settings.userEmail.value,
+                        fromEmail = settings.currentSenderEmail(),
                         password = settings.smtpPassword.value,
                     )
                     val result = withContext(Dispatchers.IO) {

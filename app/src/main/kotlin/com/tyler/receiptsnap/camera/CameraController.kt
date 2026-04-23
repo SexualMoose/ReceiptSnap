@@ -71,7 +71,11 @@ class CameraController(private val context: Context) {
         imageCapture = capture
 
         val selectedSize = capture.resolutionInfo?.resolution
-        Log.i("CameraController", "Selected capture resolution: $selectedSize")
+        val mp = selectedSize?.let { (it.width.toLong() * it.height) / 1_000_000.0 }
+        Log.i(
+            "CameraController",
+            "Selected capture resolution: $selectedSize (~${mp?.let { "%.1f".format(it) } ?: "?"} MP)",
+        )
     }
 
     suspend fun capture(): Bitmap = suspendCancellableCoroutine { cont ->
@@ -127,6 +131,11 @@ class CameraController(private val context: Context) {
         val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
             ?: error("Failed to decode JPEG (${bytes.size} bytes)")
+        Log.i(
+            "CameraController",
+            "Decoded bitmap: ${decoded.width}×${decoded.height} (~" +
+                "%.1f".format(decoded.width.toLong() * decoded.height / 1_000_000.0) + " MP)",
+        )
 
         if (degrees == 0f) return decoded
         val m = Matrix().apply { postRotate(degrees) }

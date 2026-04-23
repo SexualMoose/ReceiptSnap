@@ -29,6 +29,13 @@ class SettingsStore(context: Context) {
     private val _userEmail = MutableStateFlow(prefs.getString(KEY_EMAIL, DEFAULT_EMAIL) ?: DEFAULT_EMAIL)
     val userEmail: StateFlow<String> = _userEmail.asStateFlow()
 
+    /** The mailbox that actually sends the email — separate from the "Coupa
+     *  identity" email. Lets the user send from a personal Gmail / Outlook
+     *  account via SMTP while Coupa still attributes the receipt to the
+     *  work email (because Coupa's recipient address encodes it). */
+    private val _senderEmail = MutableStateFlow(prefs.getString(KEY_SENDER, "") ?: "")
+    val senderEmail: StateFlow<String> = _senderEmail.asStateFlow()
+
     private val _walletOverride = MutableStateFlow(prefs.getString(KEY_OVERRIDE, "") ?: "")
     val walletOverride: StateFlow<String> = _walletOverride.asStateFlow()
 
@@ -46,6 +53,35 @@ class SettingsStore(context: Context) {
         val override = _walletOverride.value.trim()
         if (override.isNotBlank()) return override
         return deriveCoupaAddress(_userEmail.value, _companyHost.value)
+    }
+
+    /** Address used as the From on SMTP and as the SMTP login. Defaults to
+     *  the user's Coupa-identity email if the sender field is blank. */
+    fun currentSenderEmail(): String {
+        val s = _senderEmail.value.trim()
+        return s.ifBlank { _userEmail.value.trim() }
+    }
+
+    fun setSenderEmail(value: String) {
+        val v = value.trim()
+        prefs.edit().putString(KEY_SENDER, v).apply()
+        _senderEmail.value = v
+    }
+
+    /**
+     * Reset every stored field back to the out-of-the-box defaults. Used by
+     * the "Restore defaults" button in Settings. Note that this also clears
+     * the SMTP password since its default is empty.
+     */
+    fun restoreDefaults() {
+        prefs.edit().clear().apply()
+        _companyHost.value = DEFAULT_HOST
+        _userEmail.value = DEFAULT_EMAIL
+        _senderEmail.value = ""
+        _walletOverride.value = ""
+        _smtpHost.value = DEFAULT_SMTP_HOST
+        _smtpPort.value = DEFAULT_SMTP_PORT
+        _smtpPassword.value = ""
     }
 
     fun setSmtpHost(value: String) {
@@ -88,6 +124,7 @@ class SettingsStore(context: Context) {
         private const val PREF_NAME = "receipt_snap_settings"
         private const val KEY_HOST = "company_host"
         private const val KEY_EMAIL = "user_email"
+        private const val KEY_SENDER = "sender_email"
         private const val KEY_OVERRIDE = "coupa_wallet_override"
         private const val KEY_SMTP_HOST = "smtp_host"
         private const val KEY_SMTP_PORT = "smtp_port"

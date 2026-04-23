@@ -3,27 +3,40 @@ package com.tyler.receiptsnap.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.tyler.receiptsnap.ReceiptSnapApp
+import com.tyler.receiptsnap.data.SettingsStore
 
 @Composable
 fun SettingsScreen(modifier: Modifier = Modifier) {
@@ -32,13 +45,42 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
 
     val host by settings.companyHost.collectAsState()
     val email by settings.userEmail.collectAsState()
+    val sender by settings.senderEmail.collectAsState()
     val override by settings.walletOverride.collectAsState()
     val smtpHost by settings.smtpHost.collectAsState()
     val smtpPort by settings.smtpPort.collectAsState()
     val smtpPassword by settings.smtpPassword.collectAsState()
-    val derived = if (override.isBlank())
-        com.tyler.receiptsnap.data.SettingsStore.deriveCoupaAddress(email, host)
+
+    val derivedWallet = if (override.isBlank())
+        SettingsStore.deriveCoupaAddress(email, host)
     else override
+
+    var confirmRestore by remember { mutableStateOf(false) }
+
+    if (confirmRestore) {
+        AlertDialog(
+            onDismissRequest = { confirmRestore = false },
+            title = { Text("Restore defaults?") },
+            text = {
+                Text(
+                    "Every setting — including the SMTP password — will be " +
+                        "reset to its default value."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmRestore = false
+                    settings.restoreDefaults()
+                }) { Text("Restore", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmRestore = false }) { Text("Cancel") }
+            },
+            containerColor = Color(0xFF141414),
+            titleContentColor = Color.White,
+            textContentColor = Color.White.copy(alpha = 0.8f),
+        )
+    }
 
     Column(
         modifier = modifier
@@ -48,12 +90,20 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        Text(
-            text = "Settings",
-            color = MaterialTheme.colorScheme.primary,
-            fontWeight = FontWeight.SemiBold,
-            style = MaterialTheme.typography.titleMedium,
-        )
+        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text(
+                text = "Settings",
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedButton(
+                onClick = { confirmRestore = true },
+            ) {
+                Text("Restore defaults", color = Color.White)
+            }
+        }
 
         Section(title = "Coupa") {
             DarkOutlinedField(
@@ -65,16 +115,16 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             DarkOutlinedField(
                 value = email,
                 onValueChange = settings::setUserEmail,
-                label = "Your work email",
+                label = "Your work email (Coupa identity)",
                 placeholder = "tyler.keller@psabdp.com",
             )
             Text(
-                text = "Receipts will be emailed to:",
+                text = "Receipts will be routed to:",
                 color = Color.White.copy(alpha = 0.7f),
                 style = MaterialTheme.typography.bodySmall,
             )
             Text(
-                text = derived.ifBlank { "(enter host and email first)" },
+                text = derivedWallet.ifBlank { "(enter host and work email first)" },
                 color = MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Medium,
@@ -95,6 +145,21 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
 
         Section(title = "Outgoing Email (SMTP)") {
             DarkOutlinedField(
+                value = sender,
+                onValueChange = settings::setSenderEmail,
+                label = "Sender email (SMTP From + login)",
+                placeholder = email.ifBlank { "you@example.com" },
+            )
+            Text(
+                text = "Defaults to your Coupa identity email when left blank. " +
+                    "Coupa identifies the receipt by the TO address regardless of " +
+                    "what sends it, so you can safely send from any mailbox here " +
+                    "(e.g. a personal Gmail).",
+                color = Color.White.copy(alpha = 0.55f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(4.dp))
+            DarkOutlinedField(
                 value = smtpHost,
                 onValueChange = settings::setSmtpHost,
                 label = "SMTP host",
@@ -102,9 +167,7 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             )
             DarkOutlinedField(
                 value = smtpPort.toString(),
-                onValueChange = { raw ->
-                    raw.toIntOrNull()?.let { settings.setSmtpPort(it) }
-                },
+                onValueChange = { raw -> raw.toIntOrNull()?.let(settings::setSmtpPort) },
                 label = "SMTP port",
                 placeholder = "587",
                 keyboardType = KeyboardType.Number,
@@ -112,18 +175,64 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             DarkOutlinedField(
                 value = smtpPassword,
                 onValueChange = settings::setSmtpPassword,
-                label = "SMTP password (or app password)",
+                label = "SMTP password",
                 placeholder = "",
                 isPassword = true,
             )
-            Text(
-                text = "For Microsoft 365 with MFA, create an app password at " +
-                    "account.microsoft.com → Security → App passwords, and " +
-                    "paste it here.",
-                color = Color.White.copy(alpha = 0.55f),
-                style = MaterialTheme.typography.bodySmall,
-            )
+            GmailHelpCard()
+            Button(
+                onClick = {
+                    settings.setSmtpHost("smtp.gmail.com")
+                    settings.setSmtpPort(587)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF1A1A1A),
+                    contentColor = MaterialTheme.colorScheme.primary,
+                ),
+            ) {
+                Text("Use Gmail defaults (smtp.gmail.com:587)")
+            }
+            Button(
+                onClick = {
+                    settings.setSmtpHost("smtp.office365.com")
+                    settings.setSmtpPort(587)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF1A1A1A),
+                    contentColor = MaterialTheme.colorScheme.primary,
+                ),
+            ) {
+                Text("Use Office 365 defaults (smtp.office365.com:587)")
+            }
         }
+    }
+}
+
+@Composable
+private fun GmailHelpCard() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0A0A0A))
+            .padding(12.dp),
+    ) {
+        Text(
+            text = "Using Gmail?",
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.labelMedium,
+        )
+        Text(
+            text = "1. Enable 2-step verification at myaccount.google.com.\n" +
+                "2. Visit myaccount.google.com/apppasswords and create an app " +
+                "password (any name — e.g. \"ReceiptSnap\").\n" +
+                "3. Paste the 16-character password above. Your regular Gmail " +
+                "password won't work.",
+            color = Color.White.copy(alpha = 0.75f),
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 
@@ -156,7 +265,7 @@ private fun DarkOutlinedField(
         placeholder = { Text(placeholder, color = Color.White.copy(alpha = 0.35f)) },
         singleLine = true,
         modifier = Modifier.fillMaxWidth(),
-        visualTransformation = if (isPassword) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+        visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions = KeyboardOptions(
             keyboardType = if (isPassword) KeyboardType.Password else keyboardType,
         ),
@@ -173,4 +282,3 @@ private fun DarkOutlinedField(
         ),
     )
 }
-
