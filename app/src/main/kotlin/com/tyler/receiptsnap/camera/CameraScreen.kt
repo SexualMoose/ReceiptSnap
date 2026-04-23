@@ -39,7 +39,7 @@ fun CameraScreen(
     busy: Boolean,
     statusText: String?,
     modifier: Modifier = Modifier,
-    onCapture: (controller: CameraController) -> Unit,
+    onCapture: (controller: CameraController, lifecycleOwner: androidx.lifecycle.LifecycleOwner, previewView: PreviewView) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -83,7 +83,13 @@ fun CameraScreen(
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
-                    onClick = { if (!busy) onCapture(controller) },
+                    onClick = {
+                        if (!busy) {
+                            previewViewState.value?.let { pv ->
+                                onCapture(controller, lifecycleOwner, pv)
+                            }
+                        }
+                    },
                     enabled = !busy,
                     modifier = Modifier
                         .size(84.dp)

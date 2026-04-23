@@ -1,0 +1,36 @@
+<!--
+  Themed-icon (monochrome) layer for Android 13+. A single-color silhouette
+  that the system tints with the user's chosen accent. We use the same
+  receipt silhouette with its perforated bottom plus the scan-badge ring
+  so the shape is still recognizably a receipt-scanner at thumb size.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Receipt silhouette -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 34 22
+                          L 76 22
+                          L 76 80
+                          L 72 82 L 68 80 L 64 82 L 60 80 L 56 82 L 52 80 L 48 82 L 44 80 L 40 82 L 36 80 L 34 82
+                          Z" />
+
+    <!-- Cut-out of the text rows so the silhouette has interior detail
+         rather than looking like a solid rectangle -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M 40 39 L 64 39 L 64 41 L 40 41 Z
+                          M 40 44 L 70 44 L 70 46 L 40 46 Z
+                          M 40 49 L 58 49 L 58 51 L 40 51 Z
+                          M 40 54 L 68 54 L 68 56 L 40 56 Z" />
+
+    <!-- Scan badge ring -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 74 74 m -13 0 a 13 13 0 1 0 26 0 a 13 13 0 1 0 -26 0 Z
+                          M 74 74 m -9 0 a 9 9 0 1 1 18 0 a 9 9 0 1 1 -18 0 Z" />
+</vector>

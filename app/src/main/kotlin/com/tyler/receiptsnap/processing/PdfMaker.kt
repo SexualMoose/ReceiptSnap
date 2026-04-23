@@ -66,21 +66,27 @@ object PdfMaker {
     }
 
     private fun loadBitmap(context: Context, uri: Uri): Bitmap? {
-        // Cap the decoded bitmap so we don't allocate a 200MP bitmap into RAM
-        // for PDF rendering — print resolution doesn't benefit from that.
+        // We send receipts by email; the PDF should be readable but small
+        // so the SMTP round-trip is fast. 1600 px on the long side at
+        // ~200 DPI is plenty of resolution to read every line of a printed
+        // receipt without bloating the attachment — around 300 KB/page vs
+        // 3+ MB at native capture resolution.
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, bounds)
         }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
-        val maxSide = 2400  // at 300 DPI, ~8x6 inches — plenty for US Letter
+        val maxSide = 1600
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / sample > maxSide) sample *= 2
 
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
+            // RGB_565 halves the in-memory size of the decoded bitmap versus
+            // ARGB_8888. For a grayscale-ish receipt on white paper the
+            // visible quality difference is nil.
+            inPreferredConfig = Bitmap.Config.RGB_565
         }
         return context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, opts)

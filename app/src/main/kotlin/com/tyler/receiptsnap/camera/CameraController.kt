@@ -7,14 +7,9 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CameraMetadata
-import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.params.StreamConfigurationMap
-import android.os.Build
 import android.util.Log
 import android.util.Size
 import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
@@ -38,106 +33,241 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
- * Wraps CameraX ImageCapture targeting the largest output the sensor can
- * produce. On Samsung S26 Ultra (and any device exposing a 200 MP main
- * sensor) the biggest output lives in the sensor's MAXIMUM_RESOLUTION
- * pixel mode, which CameraX will NOT automatically pick via just
- * PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE — the config-map and the
- * per-request SENSOR_PIXEL_MODE have to be set explicitly. This class
- * does that.
- *
- * Fallback: when the sensor doesn't advertise a max-res configuration
- * (older devices or a lens with no remosaic mode), we fall back to the
- * default highest-resolution strategy.
+ * CameraX wrapper that:
+ *   - Identifies the device's back physical cameras by focal length
+ *     (ultrawide / main / telephoto / periscope).
+ *   - Binds to the telephoto by default — it gives the best pixel-per-glyph
+ *     density for receipts photographed at a typical hand-held distance.
+ *   - Captures one primary bitmap (the telephoto) and, in a rapid follow-up
+ *     sequence, a secondary bitmap from the main wide and a tertiary from
+ *     the ultrawide, so the review UI can fall back to a wider-field image
+ *     when the user taps to add a receipt the telephoto missed.
  */
 class CameraController(private val context: Context) {
+
+    enum class Lens { UltraWide, Main, Telephoto, Periscope }
+
+    data class CameraLens(
+        val physicalId: String,
+        val kind: Lens,
+        val focalLengthMm: Float,
+        /** Rough focal-length ratio to the MAIN lens, used to map tap
+         *  coordinates between captures when parallax is negligible. */
+        val mainRatio: Float,
+    )
+
+    data class CapturedFrame(
+        val bitmap: Bitmap,
+        val lens: CameraLens,
+    )
 
     private val executor = Executors.newSingleThreadExecutor()
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
+    private var provider: ProcessCameraProvider? = null
+    private var boundPhysicalId: String? = null
+
+    /** Populated once on first bind. Ordered by focal length ascending. */
+    private var knownLenses: List<CameraLens> = emptyList()
+    private var primaryLens: CameraLens? = null
+
+    // --- public API ---------------------------------------------------------
+
+    /** Binds the preview to the best telephoto lens the device exposes, or
+     *  falls back to the default back camera when no telephoto is found. */
+    suspend fun bind(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+        val cameraProvider = ProcessCameraProvider.getInstance(context).awaitInstance()
+        this.provider = cameraProvider
+        if (knownLenses.isEmpty()) {
+            knownLenses = enumerateBackLenses()
+            Log.i(TAG, "Back lenses: ${knownLenses.joinToString { "${it.kind}(id=${it.physicalId} ${it.focalLengthMm}mm)" }}")
+        }
+        primaryLens = choosePrimaryLens(knownLenses)
+        Log.i(TAG, "Primary lens: ${primaryLens?.kind} (id=${primaryLens?.physicalId})")
+
+        bindLens(cameraProvider, lifecycleOwner, previewView, primaryLens)
+    }
+
+    /**
+     * Capture a full set of frames. The primary (telephoto if available) is
+     * captured first with the bound preview; then the preview is re-bound to
+     * each other lens in turn and a JPEG is captured so the user can review
+     * multiple viewpoints. Returns the list in primary-first order. The
+     * preview is re-bound to the primary lens on completion.
+     */
+    suspend fun captureAll(
+        lifecycleOwner: LifecycleOwner,
+        previewView: PreviewView,
+    ): List<CapturedFrame> {
+        val cameraProvider = provider ?: error("Camera not bound")
+        val lenses = knownLenses
+        if (lenses.isEmpty()) return emptyList()
+
+        val primary = primaryLens ?: lenses.first()
+        // Dedupe by lens kind — devices often expose several physical "main"
+        // cameras (different binning modes, OIS variants) that behave
+        // identically for our purposes. Capturing all of them just burns
+        // 2–3 s per redundant rebind. Skip the periscope because its
+        // minimum focus distance (~1 m) excludes tabletop receipt shots.
+        val secondaryOrder = lenses
+            .filter { it != primary && it.kind != Lens.Periscope }
+            .distinctBy { it.kind }
+            .sortedBy {
+                when (it.kind) {
+                    Lens.Main -> 0
+                    Lens.UltraWide -> 1
+                    Lens.Telephoto -> 2
+                    Lens.Periscope -> 3
+                }
+            }
+
+        val frames = mutableListOf<CapturedFrame>()
+
+        // Primary — preview is already bound to this lens.
+        runCatching { captureOnce() }
+            .onSuccess { frames += CapturedFrame(it, primary) }
+            .onFailure { Log.e(TAG, "Primary capture failed on ${primary.kind}", it) }
+
+        // Secondary / tertiary — rebind briefly, capture, rebind back.
+        for (lens in secondaryOrder) {
+            try {
+                bindLens(cameraProvider, lifecycleOwner, previewView, lens)
+                frames += CapturedFrame(captureOnce(), lens)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Secondary capture failed on ${lens.kind}", t)
+            }
+        }
+
+        // Leave preview bound to the primary lens.
+        runCatching { bindLens(cameraProvider, lifecycleOwner, previewView, primary) }
+
+        return frames
+    }
+
+    /** Backwards-compatible single-shot capture for the primary lens. */
+    suspend fun capture(): Bitmap = captureOnce()
+
+    fun release() {
+        executor.shutdown()
+        camera = null
+        imageCapture = null
+        provider = null
+        boundPhysicalId = null
+    }
+
+    // --- internals ----------------------------------------------------------
 
     @OptIn(ExperimentalCamera2Interop::class)
-    suspend fun bind(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        // Diagnostic: walk every physical camera the device exposes to the
-        // public Camera2 API so we can see what's actually available on this
-        // firmware. Samsung's 200 MP sensor often sits on a physical sub-
-        // camera of a logical multi-camera; CameraX's default back camera
-        // may not surface that sub-camera's MAXIMUM_RESOLUTION map.
-        logAllPhysicalCameras()
+    private fun enumerateBackLenses(): List<CameraLens> {
+        val mgr = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
+            ?: return emptyList()
+        val listed = runCatching { mgr.cameraIdList }.getOrDefault(emptyArray()).toSet()
+        val hidden = listed.flatMap { id ->
+            runCatching { mgr.getCameraCharacteristics(id).physicalCameraIds }
+                .getOrDefault(emptySet())
+        }.toSet()
+        val all = (listed + hidden).toSortedSet()
 
-        val provider = ProcessCameraProvider.getInstance(context).awaitInstance()
-        provider.unbindAll()
+        val candidates = mutableListOf<Pair<String, Float>>()
+        for (id in all) {
+            val chars = runCatching { mgr.getCameraCharacteristics(id) }.getOrNull() ?: continue
+            if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK)
+                continue
+            val focals = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                ?: continue
+            if (focals.isEmpty()) continue
+            candidates += id to focals.max()
+        }
+        if (candidates.isEmpty()) return emptyList()
+
+        val mainFocal = candidates.map { it.second }
+            .filter { it in 3.0f..10.0f }  // typical 24-28mm-equivalent main lens
+            .minOrNull() ?: candidates.map { it.second }.min()
+
+        return candidates
+            .sortedBy { it.second }
+            .map { (id, focal) ->
+                val kind = classifyLens(focal)
+                CameraLens(
+                    physicalId = id,
+                    kind = kind,
+                    focalLengthMm = focal,
+                    mainRatio = focal / mainFocal.coerceAtLeast(0.01f),
+                )
+            }
+    }
+
+    private fun classifyLens(focalMm: Float): Lens = when {
+        focalMm < 3.0f -> Lens.UltraWide
+        focalMm < 10.0f -> Lens.Main
+        focalMm < 25.0f -> Lens.Telephoto
+        else -> Lens.Periscope
+    }
+
+    /** Prefer the regular telephoto (3× range). Fall back to main wide if the
+     *  device doesn't have one; the periscope (10×) is rarely a good default
+     *  because its minimum focus distance is ~1 m which excludes most
+     *  table-top receipt shots. */
+    private fun choosePrimaryLens(lenses: List<CameraLens>): CameraLens? {
+        return lenses.firstOrNull { it.kind == Lens.Telephoto }
+            ?: lenses.firstOrNull { it.kind == Lens.Main }
+            ?: lenses.firstOrNull()
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    private suspend fun bindLens(
+        cameraProvider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        previewView: PreviewView,
+        lens: CameraLens?,
+    ) {
+        if (lens != null && lens.physicalId == boundPhysicalId && imageCapture != null) return
+        cameraProvider.unbindAll()
 
         val preview = Preview.Builder().build().also {
             it.surfaceProvider = previewView.surfaceProvider
         }
 
-        // Inspect the back camera's MAXIMUM_RESOLUTION stream config map
-        // (Android 12+, API 31). If present, we lock the capture resolution
-        // to the largest advertised JPEG size and set SENSOR_PIXEL_MODE on
-        // every capture request so the sensor actually operates in its
-        // high-res mode.
-        val backCameraInfo = pickBackCameraInfo(provider)
-        val maxResJpeg = backCameraInfo?.let { queryMaxResolutionJpegSize(it) }
-
-        val resolutionSelector = if (maxResJpeg != null) {
-            ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(maxResJpeg, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(Int.MAX_VALUE, Int.MAX_VALUE),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER,
                 )
-                .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
-                .build()
-        } else {
-            ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(
-                        Size(Int.MAX_VALUE, Int.MAX_VALUE),
-                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER,
-                    )
-                )
-                .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
-                .build()
-        }
+            )
+            .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+            .build()
 
         val captureBuilder = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
             .setResolutionSelector(resolutionSelector)
             .setFlashMode(ImageCapture.FLASH_MODE_AUTO)
 
-        // Per-capture-request: opt into SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION
-        // (API 31+) so the sensor produces the high-res (e.g. 200 MP) frame.
-        // Without this, the CaptureRequest defaults to the binned pixel mode
-        // even when the resolution map says a 200 MP output exists.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && maxResJpeg != null) {
-            Camera2Interop.Extender(captureBuilder).setCaptureRequestOption(
-                CaptureRequest.SENSOR_PIXEL_MODE,
-                CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION,
-            )
-            Log.i(TAG, "SENSOR_PIXEL_MODE set to MAXIMUM_RESOLUTION for ${maxResJpeg.width}×${maxResJpeg.height}")
-        } else {
-            Log.i(TAG, "Max-resolution sensor mode unavailable — using default sensor mode")
+        val selectorBuilder = CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+        if (lens != null) {
+            // Physical-id binding is supported from CameraX 1.4+. Requires the
+            // physical camera to be a child of an accessible logical camera,
+            // which on S26 Ultra covers all 4 back lenses.
+            selectorBuilder.setPhysicalCameraId(lens.physicalId)
         }
+        val selector = selectorBuilder.build()
 
         val capture = captureBuilder.build()
-
-        camera = provider.bindToLifecycle(
-            lifecycleOwner,
-            CameraSelector.DEFAULT_BACK_CAMERA,
-            preview,
-            capture,
-        )
+        camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
         imageCapture = capture
+        boundPhysicalId = lens?.physicalId
 
-        val selected = capture.resolutionInfo?.resolution
-        val mp = selected?.let { (it.width.toLong() * it.height) / 1_000_000.0 }
+        val selectedSize = capture.resolutionInfo?.resolution
+        val mp = selectedSize?.let { (it.width.toLong() * it.height) / 1_000_000.0 }
         Log.i(
             TAG,
-            "Bound capture: $selected (~${mp?.let { "%.1f".format(it) } ?: "?"} MP) " +
-                "maxResConfigured=${maxResJpeg != null}",
+            "Bound ${lens?.kind ?: "default"} lens (id=${lens?.physicalId}): " +
+                "$selectedSize (~${mp?.let { "%.1f".format(it) } ?: "?"} MP)",
         )
     }
 
-    suspend fun capture(): Bitmap = suspendCancellableCoroutine { cont ->
+    private suspend fun captureOnce(): Bitmap = suspendCancellableCoroutine { cont ->
         val capture = imageCapture ?: run {
             cont.resumeWithException(IllegalStateException("Camera not bound"))
             return@suspendCancellableCoroutine
@@ -145,128 +275,17 @@ class CameraController(private val context: Context) {
         capture.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
             override fun onCaptureSuccess(image: ImageProxy) {
                 try {
-                    val bitmap = image.toOrientedBitmap()
-                    cont.resume(bitmap)
+                    cont.resume(image.toOrientedBitmap())
                 } catch (t: Throwable) {
                     cont.resumeWithException(t)
                 } finally {
                     image.close()
                 }
             }
-
             override fun onError(exception: ImageCaptureException) {
                 cont.resumeWithException(exception)
             }
         })
-    }
-
-    fun release() {
-        executor.shutdown()
-        camera = null
-        imageCapture = null
-    }
-
-    // ------------------------------------------------------------------
-
-    /** Dump every camera ID's key specs so we can see, in logcat, exactly
-     *  what the device advertises. Useful for understanding why the S26
-     *  Ultra might be pegged to 12.5 MP. */
-    private fun logAllPhysicalCameras() {
-        val mgr = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return
-        val listed = runCatching { mgr.cameraIdList }.getOrDefault(emptyArray()).toSet()
-        // Pick up hidden physical sub-IDs from each logical camera so we can
-        // also probe the 200 MP-class lenses that Samsung leaves out of
-        // cameraIdList.
-        val hidden = listed.flatMap { id ->
-            runCatching { mgr.getCameraCharacteristics(id).physicalCameraIds }
-                .getOrDefault(emptySet())
-        }.toSet()
-        val allIds = (listed + hidden).sorted()
-        Log.i(TAG, "Camera IDs (listed+physical): ${allIds.joinToString()} (listed=$listed, hidden=$hidden)")
-        for (id in allIds) {
-            val chars = runCatching { mgr.getCameraCharacteristics(id) }.getOrNull() ?: continue
-            val facing = chars.get(CameraCharacteristics.LENS_FACING)
-            val facingName = when (facing) {
-                CameraCharacteristics.LENS_FACING_FRONT -> "FRONT"
-                CameraCharacteristics.LENS_FACING_BACK -> "BACK"
-                CameraCharacteristics.LENS_FACING_EXTERNAL -> "EXTERNAL"
-                else -> "?"
-            }
-            val pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
-            val defaultMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val defaultMax = defaultMap?.getOutputSizes(ImageFormat.JPEG)
-                ?.maxByOrNull { it.width.toLong() * it.height }
-            val defaultMp = defaultMax?.let { (it.width.toLong() * it.height) / 1_000_000.0 }
-            val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                ?.joinToString()
-            var maxResInfo = "n/a"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val maxResMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
-                val maxResMax = maxResMap?.getOutputSizes(ImageFormat.JPEG)
-                    ?.maxByOrNull { it.width.toLong() * it.height }
-                val maxResMp = maxResMax?.let { (it.width.toLong() * it.height) / 1_000_000.0 }
-                maxResInfo = if (maxResMax != null)
-                    "$maxResMax (${"%.1f".format(maxResMp)} MP)"
-                else "none"
-            }
-            val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
-                runCatching { chars.physicalCameraIds }.getOrDefault(emptySet()).joinToString()
-            else ""
-            Log.i(
-                TAG,
-                "cam[$id] facing=$facingName sensor=$pixelArray " +
-                    "defaultMaxJpeg=$defaultMax${defaultMp?.let { " (${"%.1f".format(it)} MP)" } ?: ""} " +
-                    "maxResJpeg=$maxResInfo " +
-                    "physicalIds=[$physicalIds] caps=[$capabilities]",
-            )
-        }
-    }
-
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun pickBackCameraInfo(provider: ProcessCameraProvider): CameraInfo? {
-        return provider.availableCameraInfos.firstOrNull { info ->
-            val c2 = Camera2CameraInfo.from(info)
-            c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING) ==
-                CameraCharacteristics.LENS_FACING_BACK
-        }
-    }
-
-    /**
-     * Returns the largest JPEG output size in the MAXIMUM_RESOLUTION stream
-     * configuration map for the given camera, or null if the sensor doesn't
-     * expose that mode. The MAXIMUM_RESOLUTION map is the one that contains
-     * full-resolution (non-binned) outputs on modern sensors.
-     */
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun queryMaxResolutionJpegSize(cameraInfo: CameraInfo): Size? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
-        val chars = Camera2CameraInfo.from(cameraInfo)
-        val maxResMap: StreamConfigurationMap? = chars.getCameraCharacteristic(
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION
-        )
-        if (maxResMap == null) {
-            Log.i(TAG, "No SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION on this camera")
-            return null
-        }
-        val jpegSizes = maxResMap.getOutputSizes(ImageFormat.JPEG)
-        if (jpegSizes.isNullOrEmpty()) {
-            Log.i(TAG, "Max-res config map has no JPEG output sizes")
-            return null
-        }
-        val largest = jpegSizes.maxByOrNull { it.width.toLong() * it.height } ?: return null
-        val mp = (largest.width.toLong() * largest.height) / 1_000_000.0
-        Log.i(TAG, "Max-res JPEG sizes: ${jpegSizes.joinToString()} → picking $largest (${"%.1f".format(mp)} MP)")
-
-        // Also log the default (non-max-res) map so we can tell in logs
-        // whether the high-res selection actually mattered.
-        val defaultMap = chars.getCameraCharacteristic(
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
-        )
-        val defaultLargest = defaultMap?.getOutputSizes(ImageFormat.JPEG)
-            ?.maxByOrNull { it.width.toLong() * it.height }
-        Log.i(TAG, "Default-mode max JPEG size: $defaultLargest")
-
-        return largest
     }
 
     private fun ImageProxy.toOrientedBitmap(): Bitmap {
@@ -290,11 +309,6 @@ class CameraController(private val context: Context) {
         val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
             ?: error("Failed to decode JPEG (${bytes.size} bytes)")
-        Log.i(
-            TAG,
-            "Decoded bitmap: ${decoded.width}×${decoded.height} (~" +
-                "%.1f".format(decoded.width.toLong() * decoded.height / 1_000_000.0) + " MP)",
-        )
 
         if (degrees == 0f) return decoded
         val m = Matrix().apply { postRotate(degrees) }
@@ -310,6 +324,10 @@ class CameraController(private val context: Context) {
                 ContextCompat.getMainExecutor(context),
             )
         }
+
+    // Keep for compatibility with anyone referencing CameraInfo — unused here.
+    @Suppress("unused")
+    private fun cameraInfoOrNull(): CameraInfo? = camera?.cameraInfo
 
     private companion object {
         const val TAG = "CameraController"

@@ -1,12 +1,64 @@
+<!--
+  Adaptive icon foreground (108×108 viewport, safe zone 18–90 px per side).
+  All critical content is kept within the central 72×72 safe area so device
+  icon masks (circle / squircle / rounded square) don't clip anything
+  meaningful. Outer 18 px on every side is a buffer used for parallax and
+  animation — only decorative offsets from the secondary receipt fall into
+  it, never anything the user needs to see.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- Second receipt (back), slightly offset to hint at multi-receipt capture -->
+    <path
+        android:fillColor="#D0D0D0"
+        android:pathData="M 28 30
+                          L 60 28
+                          L 62 86
+                          L 58 84 L 54 86 L 50 84 L 46 86 L 42 84 L 38 86 L 34 84 L 30 86
+                          Z" />
+
+    <!-- Front receipt body with zigzag/perforated bottom -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M30,28 L78,28 L78,84 L30,84 Z M36,36 L72,36 L72,42 L36,42 Z M36,48 L72,48 L72,54 L36,54 Z M36,60 L62,60 L62,66 L36,66 Z M36,72 L56,72 L56,78 L36,78 Z" />
+        android:pathData="M 34 22
+                          L 76 22
+                          L 76 80
+                          L 72 82 L 68 80 L 64 82 L 60 80 L 56 82 L 52 80 L 48 82 L 44 80 L 40 82 L 36 80 L 34 82
+                          Z" />
+
+    <!-- Header/logo bar -->
+    <path
+        android:fillColor="#141414"
+        android:pathData="M 40 28 L 70 28 L 70 33 L 40 33 Z" />
+
+    <!-- Item rows (varying widths for realism) -->
+    <path android:fillColor="#3A3A3A"
+          android:pathData="M 40 39 L 64 39 L 64 41 L 40 41 Z" />
+    <path android:fillColor="#3A3A3A"
+          android:pathData="M 40 44 L 70 44 L 70 46 L 40 46 Z" />
+    <path android:fillColor="#3A3A3A"
+          android:pathData="M 40 49 L 58 49 L 58 51 L 40 51 Z" />
+    <path android:fillColor="#3A3A3A"
+          android:pathData="M 40 54 L 68 54 L 68 56 L 40 56 Z" />
+
+    <!-- Separator line -->
+    <path android:fillColor="#9A9A9A"
+          android:pathData="M 40 60 L 70 60 L 70 61 L 40 61 Z" />
+
+    <!-- Bold total row -->
+    <path android:fillColor="#141414"
+          android:pathData="M 40 65 L 70 65 L 70 69 L 40 69 Z" />
+
+    <!-- Scan/verify badge: accent circle with a check, anchored in the
+         bottom-right of the safe zone. Overlaps the receipt for depth. -->
     <path
         android:fillColor="#00E5A0"
-        android:pathData="M68,70 L82,56 L88,62 L68,82 L58,72 L64,66 Z" />
+        android:pathData="M 74 74 m -13 0 a 13 13 0 1 0 26 0 a 13 13 0 1 0 -26 0 Z" />
+    <path
+        android:fillColor="#141414"
+        android:pathData="M 68 74 L 72.5 78.5 L 82 69 L 84 71 L 72.5 82.5 L 66 76 Z" />
 </vector>

@@ -32,9 +32,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         data object Camera : Phase
         data class Review(
             val bitmap: Bitmap,
+            /** Frames from secondary lenses (main, ultrawide) with their
+             *  focal ratios to the primary — used to map a tap point from
+             *  the primary preview into each secondary image when the user
+             *  taps a receipt the primary missed. */
+            val secondaries: List<SecondaryFrame>,
             val quads: List<DocumentDetector.Quad>,
             val nextQuadId: Long,
         ) : Phase
+
+        data class SecondaryFrame(
+            val bitmap: Bitmap,
+            /** focalLength(primary) / focalLength(this) — telephoto-to-main
+             *  is ~3.0, so tap displacements shrink by this factor. */
+            val focalRatioToPrimary: Float,
+        )
     }
 
     data class UiState(
@@ -48,22 +60,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    fun capture(controller: CameraController) {
+    fun capture(controller: CameraController, lifecycleOwner: androidx.lifecycle.LifecycleOwner, previewView: androidx.camera.view.PreviewView) {
         if (_state.value.busy) return
         viewModelScope.launch {
-            _state.value = _state.value.copy(busy = true, status = "Capturing…", error = null)
-            val photo = try {
-                controller.capture()
+            _state.value = _state.value.copy(busy = true, status = "Capturing primary…", error = null)
+
+            val frames = try {
+                controller.captureAll(lifecycleOwner, previewView)
             } catch (t: Throwable) {
-                Log.e(TAG, "Capture failed", t)
-                _state.value = _state.value.copy(busy = false, status = null, error = t.message)
+                Log.e(TAG, "captureAll failed", t)
+                emptyList()
+            }
+            if (frames.isEmpty()) {
+                _state.value = _state.value.copy(busy = false, status = null, error = "Capture failed.")
                 return@launch
+            }
+
+            val primary = frames.first()
+            val secondaries = frames.drop(1).map { f ->
+                Phase.SecondaryFrame(
+                    bitmap = f.bitmap,
+                    focalRatioToPrimary = primary.lens.focalLengthMm / f.lens.focalLengthMm.coerceAtLeast(0.01f),
+                )
             }
 
             _state.value = _state.value.copy(status = "Detecting documents…")
             val quads = withContext(Dispatchers.Default) {
                 try {
-                    DocumentDetector.detect(photo)
+                    DocumentDetector.detect(primary.bitmap)
                 } catch (t: Throwable) {
                     Log.e(TAG, "Detection failed", t)
                     emptyList()
@@ -72,12 +96,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
             val stats = DocumentDetector.lastStats
             val diag = "OCR: ${stats.textLines} lines · ${stats.clusters} clusters " +
-                "· ${stats.fromText} from text · ${stats.fromEdges} from edges"
+                "· ${stats.fromText} from text · ${stats.fromEdges} from edges · " +
+                "lens=${primary.lens.kind} +${secondaries.size} secondary"
             Log.i(TAG, diag)
 
             _state.value = _state.value.copy(
                 phase = Phase.Review(
-                    bitmap = photo,
+                    bitmap = primary.bitmap,
+                    secondaries = secondaries,
                     quads = quads,
                     nextQuadId = (quads.maxOfOrNull { it.id } ?: 0L) + 1,
                 ),
@@ -99,14 +125,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun addQuadFromSeed(seedX: Double, seedY: Double) {
         val phase = _state.value.phase as? Phase.Review ?: return
         viewModelScope.launch {
+            // Try the primary capture first. If the primary missed a
+            // receipt but the user saw it, try each secondary frame too —
+            // the main/ultrawide may have caught it when the telephoto
+            // didn't (e.g. the receipt was outside the telephoto FOV).
             val grown = withContext(Dispatchers.Default) {
-                try {
+                val primaryHit = try {
                     DocumentDetector.growFromSeed(phase.bitmap, seedX, seedY, phase.nextQuadId)
                 } catch (t: Throwable) {
-                    Log.w(TAG, "growFromSeed failed", t)
-                    null
+                    Log.w(TAG, "growFromSeed on primary failed", t); null
                 }
+                if (primaryHit != null) return@withContext primaryHit
+
+                // Fall back through secondaries. We map the tap point from
+                // the primary's pixel space into each secondary assuming
+                // the same world scene is centred in both frames and FOV
+                // scales inversely with focal length.
+                for (sec in phase.secondaries) {
+                    val mapped = mapCoords(phase.bitmap, sec, seedX, seedY)
+                        ?: continue
+                    val hit = try {
+                        DocumentDetector.growFromSeed(sec.bitmap, mapped.first, mapped.second, phase.nextQuadId)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "growFromSeed on secondary failed", t); null
+                    }
+                    if (hit != null) {
+                        // Translate corners back into primary coords so the
+                        // review overlay can render them correctly.
+                        val primaryCorners = hit.corners.map { p ->
+                            val back = mapCoordsBack(phase.bitmap, sec, p.x, p.y) ?: return@map p
+                            org.opencv.core.Point(back.first, back.second)
+                        }
+                        return@withContext DocumentDetector.Quad(
+                            id = hit.id,
+                            corners = primaryCorners,
+                        )
+                    }
+                }
+                null
             }
+
             val quad = grown ?: defaultQuadAt(phase.bitmap, seedX, seedY, phase.nextQuadId)
 
             _state.update { current ->
@@ -116,13 +174,47 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         quads = p.quads + quad,
                         nextQuadId = p.nextQuadId + 1,
                     ),
-                    status = if (grown != null)
-                        "Added region from similar background"
-                    else
-                        "Couldn't find a similar region — added placeholder",
+                    status = when {
+                        grown != null -> "Added region (found via secondary camera if needed)"
+                        else -> "Couldn't find a similar region — placeholder added"
+                    },
                 )
             }
         }
+    }
+
+    /** Map a point in the primary bitmap to the corresponding point in
+     *  a secondary camera's bitmap, assuming both captures are centred on
+     *  the same world scene. Returns null when the point falls outside the
+     *  secondary's frame. */
+    private fun mapCoords(
+        primary: Bitmap,
+        sec: Phase.SecondaryFrame,
+        primaryX: Double,
+        primaryY: Double,
+    ): Pair<Double, Double>? {
+        val ratio = sec.focalRatioToPrimary.toDouble()
+        val dx = (primaryX - primary.width / 2.0) / ratio
+        val dy = (primaryY - primary.height / 2.0) / ratio
+        val sx = sec.bitmap.width / 2.0 + dx
+        val sy = sec.bitmap.height / 2.0 + dy
+        if (sx < 0 || sy < 0 || sx >= sec.bitmap.width || sy >= sec.bitmap.height) return null
+        return sx to sy
+    }
+
+    private fun mapCoordsBack(
+        primary: Bitmap,
+        sec: Phase.SecondaryFrame,
+        secX: Double,
+        secY: Double,
+    ): Pair<Double, Double>? {
+        val ratio = sec.focalRatioToPrimary.toDouble()
+        val dx = (secX - sec.bitmap.width / 2.0) * ratio
+        val dy = (secY - sec.bitmap.height / 2.0) * ratio
+        val px = primary.width / 2.0 + dx
+        val py = primary.height / 2.0 + dy
+        if (px < 0 || py < 0 || px >= primary.width || py >= primary.height) return null
+        return px to py
     }
 
     private fun defaultQuadAt(
@@ -168,7 +260,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelReview() {
         val current = _state.value.phase
-        if (current is Phase.Review) current.bitmap.recycle()
+        if (current is Phase.Review) {
+            current.bitmap.recycle()
+            current.secondaries.forEach { it.bitmap.recycle() }
+        }
         _state.value = UiState(phase = Phase.Camera)
     }
 
@@ -215,6 +310,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             phase.bitmap.recycle()
+            phase.secondaries.forEach { it.bitmap.recycle() }
 
             _state.value = UiState(
                 phase = Phase.Camera,

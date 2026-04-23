@@ -49,6 +49,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -82,7 +83,10 @@ data class LibraryItem(
 fun LibraryScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val settings = (context.applicationContext as ReceiptSnapApp).settings
+    val app = context.applicationContext as ReceiptSnapApp
+    val settings = app.settings
+    val sentTracker = app.sentTracker
+    val sentSet by sentTracker.sent.collectAsState()
 
     var refreshTick by remember { mutableIntStateOf(0) }
     var items by remember { mutableStateOf<List<LibraryItem>>(emptyList()) }
@@ -110,6 +114,9 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
 
     LaunchedEffect(refreshTick) {
         items = withContext(Dispatchers.IO) { loadItems(context) }
+        // Prune the sent set for entries whose files no longer exist so it
+        // can't grow unboundedly across deletes.
+        sentTracker.retain(items.map { it.uri.toString() }.toSet())
     }
 
     DisposableEffect(context) {
@@ -164,6 +171,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                     }
                     when (result) {
                         is SmtpSender.SendResult.Success -> {
+                            sentTracker.markSent(next.uri)
                             sendQueue = sendQueue.drop(1)
                             sentCount += 1
                         }
@@ -279,6 +287,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             items(items, key = { it.uri.toString() }) { item ->
                 val isSelected = item.uri in selected
                 val inSelectMode = selected.isNotEmpty()
+                val alreadySent = item.uri.toString() in sentSet
                 Column(
                     modifier = Modifier.combinedClickable(
                         onClick = {
@@ -318,6 +327,29 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
                         )
+                        // "Already sent to Coupa" indicator: small accent
+                        // check badge in the top-left corner. Stays visible
+                        // whether or not we're in select mode so users can
+                        // see at a glance what's been forwarded.
+                        if (alreadySent) {
+                            Box(
+                                modifier = Modifier
+                                    .padding(6.dp)
+                                    .size(22.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary)
+                                    .align(Alignment.TopStart),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    Icons.Default.Check,
+                                    contentDescription = "Sent to Coupa",
+                                    tint = Color.Black,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            }
+                        }
+
                         // Empty-circle checkbox on every tile in select mode
                         // so the user sees the affordance. Fills in for selected.
                         if (inSelectMode) {
