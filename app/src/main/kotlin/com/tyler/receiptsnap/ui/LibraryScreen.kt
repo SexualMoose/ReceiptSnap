@@ -69,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.tyler.receiptsnap.ReceiptSnapApp
 import com.tyler.receiptsnap.processing.CoupaUploadsFolder
+import com.tyler.receiptsnap.processing.FolderUploadProcessor
 import com.tyler.receiptsnap.processing.PdfMaker
 import com.tyler.receiptsnap.processing.SmtpSender
 import kotlinx.coroutines.Dispatchers
@@ -91,10 +92,23 @@ data class LibraryItem(
     val uri: Uri,
     val name: String,
     val dateAddedSec: Long,
-    /** When true, the item was picked via the external-folder upload flow;
-     *  after a successful send we move it into Pictures/Coupa Uploads so
-     *  the user's inbox folder stays clean. */
+    /** When true, the original source gets moved on successful send. For
+     *  gallery items: source == uri, so the Library tile disappears. For
+     *  folder uploads: the original source (possibly different from uri,
+     *  which may point at a temp crop) is moved to Pictures/Coupa Uploads. */
     val moveAfterSend: Boolean = false,
+    /** The original folder-picked file, if this item is a processed crop.
+     *  Used for archival routing: once every item that traces back to this
+     *  source finishes, the source moves to Pictures/Coupa Uploads. */
+    val sourceUri: Uri? = null,
+    val sourceName: String? = null,
+    /** PdfMaker width override — null uses the default. Folder uploads
+     *  use a wider cap since the source may be variable-quality. */
+    val pdfMaxWidthPx: Int? = null,
+    /** When true, PdfMaker embeds source bytes directly (or re-encodes
+     *  once at high quality) without scaling or aggressive compression.
+     *  Used for re-uploads from Failed Coupa Uploads. */
+    val pdfPassthrough: Boolean = false,
 )
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -117,6 +131,12 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     var sentCount by remember { mutableIntStateOf(0) }
     var sendInFlight by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
+
+    // Preprocessing progress — shown when running DocumentDetector over a
+    // picked folder before the SMTP queue fires.
+    var preprocessDone by remember { mutableIntStateOf(0) }
+    var preprocessTotal by remember { mutableIntStateOf(0) }
+    var preprocessLabel by remember { mutableStateOf<String?>(null) }
 
     // Android 11+ returns a pending intent for scoped-storage deletes that
     // need user confirmation (anything written by another app). Since we
@@ -181,6 +201,16 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
 
                 val queueSnapshot = sendQueue
                 val errorRef = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                // A single source image can yield multiple receipts (e.g.
+                // three receipts laid on one surface and captured in one
+                // external photo). Track successes and failures per
+                // source separately so archival is conservative: only
+                // move the source to Coupa Uploads when ALL its crops
+                // landed, never if any failed. Sources with mixed success
+                // stay in place so the user can fix the config and
+                // retry without losing the file.
+                val successfulSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
+                val failedSources = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Uri, String>>()
 
                 // Feed the queue into a channel so each worker pulls its
                 // own share whenever it's ready. Channel size = queue size
@@ -217,12 +247,23 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                                         .removeSuffix(".png")
                                         .removeSuffix(".webp")
                                     val result = try {
-                                        val pdf = PdfMaker.makePdf(
-                                            context = context,
-                                            imageUri = item.uri,
-                                            outputDir = PdfMaker.outputDir(context),
-                                            baseName = baseName,
-                                        )
+                                        val pdf = if (item.pdfPassthrough) {
+                                            PdfMaker.makePdfPassthrough(
+                                                context = context,
+                                                imageUri = item.uri,
+                                                outputDir = PdfMaker.outputDir(context),
+                                                baseName = baseName,
+                                            )
+                                        } else {
+                                            PdfMaker.makePdf(
+                                                context = context,
+                                                imageUri = item.uri,
+                                                outputDir = PdfMaker.outputDir(context),
+                                                baseName = baseName,
+                                                maxWidthPx = item.pdfMaxWidthPx
+                                                    ?: PdfMaker.DEFAULT_MAX_WIDTH_PX,
+                                            )
+                                        }
                                         conn.send(
                                             toEmail = recipient,
                                             subject = baseName,
@@ -238,12 +279,30 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                                     when (result) {
                                         is SmtpSender.SendResult.Success -> {
                                             sentTracker.markSent(item.uri)
+                                            // If this was a processed-folder
+                                            // crop, defer source archival to
+                                            // the post-loop pass so multiple
+                                            // crops sharing one source only
+                                            // move it once.
                                             if (item.moveAfterSend) {
-                                                runCatching {
-                                                    CoupaUploadsFolder.moveToArchive(
-                                                        context, item.uri, item.name,
-                                                    )
+                                                val srcUri = item.sourceUri
+                                                val srcName = item.sourceName
+                                                if (srcUri != null && srcName != null) {
+                                                    successfulSources.add(srcUri to srcName)
+                                                } else {
+                                                    // Legacy gallery path with uri == source
+                                                    runCatching {
+                                                        CoupaUploadsFolder.moveToArchive(
+                                                            context, item.uri, item.name,
+                                                        )
+                                                    }
                                                 }
+                                            }
+                                            // Temp crop files: delete once
+                                            // successfully sent so the cache
+                                            // doesn't accumulate.
+                                            if (item.uri.scheme == "file") {
+                                                runCatching { java.io.File(item.uri.path!!).delete() }
                                             }
                                             withContext(Dispatchers.Main) {
                                                 sendQueue = sendQueue - item
@@ -251,12 +310,27 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                                             }
                                         }
                                         is SmtpSender.SendResult.Failure -> {
+                                            val srcUri = item.sourceUri
+                                            val srcName = item.sourceName
+                                            if (srcUri != null && srcName != null) {
+                                                failedSources.add(srcUri to srcName)
+                                            }
                                             errorRef.compareAndSet(null, result.message)
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                // Archive each source whose crops ALL landed successfully.
+                // Sources with partial failure stay put so the user can
+                // retry the remaining crops without having to re-import.
+                val sourcesToArchive = successfulSources - failedSources
+                withContext(Dispatchers.IO) {
+                    for ((srcUri, srcName) in sourcesToArchive) {
+                        runCatching { CoupaUploadsFolder.moveToArchive(context, srcUri, srcName) }
                     }
                 }
 
@@ -287,18 +361,21 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
         runSendLoop()
     }
 
-    // External-folder upload: user picks any directory (Downloads, a backup
-    // folder, a screenshot album, etc.) via SAF; we enumerate every image
-    // file inside and push each through the same PDF+SMTP pipeline the
-    // in-app gallery uses. No detection — we assume each file is one
-    // receipt, ready to upload.
+    // External-folder upload — two branches:
+    //
+    //   1. User picks Pictures/Failed Coupa Uploads → passthrough mode.
+    //      Skip all detection/compression, embed each image's raw bytes
+    //      in a PDF and send. They've already decided these are receipts.
+    //
+    //   2. Any other folder → run the same DocumentDetector + ReceiptParser
+    //      pipeline as on-device captures. Each picked image can yield
+    //      0-N structured-name receipt crops. Sources with 0 detected
+    //      receipts get moved to Pictures/Failed Coupa Uploads untouched
+    //      so the user can retry manually via branch 1 if we got it wrong.
     val folderLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
         if (treeUri == null) return@rememberLauncherForActivityResult
-        // Persist R/W access for this tree across process restarts so a
-        // resumed queue keeps working. WRITE is required for the "move
-        // successful uploads into Pictures/Coupa Uploads" archive step.
         runCatching {
             context.contentResolver.takePersistableUriPermission(
                 treeUri,
@@ -307,6 +384,8 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             )
         }
         val root = DocumentFile.fromTreeUri(context, treeUri) ?: return@rememberLauncherForActivityResult
+        val folderName = root.name.orEmpty()
+        val isFailedFolder = folderName == CoupaUploadsFolder.FAILED_UPLOADS_FOLDER_NAME
         val imageFiles = root.listFiles()
             .filter { it.isFile && (it.type?.startsWith("image/") == true) }
             .sortedBy { it.name ?: "" }
@@ -314,19 +393,94 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             Toast.makeText(context, "No images found in selected folder.", Toast.LENGTH_SHORT).show()
             return@rememberLauncherForActivityResult
         }
-        val now = System.currentTimeMillis() / 1000
-        sendQueue = imageFiles.map { f ->
-            LibraryItem(
-                uri = f.uri,
-                name = f.name ?: "receipt.jpg",
-                dateAddedSec = now,
-                moveAfterSend = true,
-            )
-        }
         sentCount = 0
         sendError = null
         selected = emptySet()
-        runSendLoop()
+
+        if (isFailedFolder) {
+            // Branch 1 — passthrough. One PDF per source, source bytes
+            // embedded as-is. moveAfterSend routes to Pictures/Coupa Uploads.
+            val now = System.currentTimeMillis() / 1000
+            sendQueue = imageFiles.map { f ->
+                LibraryItem(
+                    uri = f.uri,
+                    name = f.name ?: "receipt.jpg",
+                    dateAddedSec = now,
+                    moveAfterSend = true,
+                    sourceUri = f.uri,
+                    sourceName = f.name ?: "receipt.jpg",
+                    pdfPassthrough = true,
+                )
+            }
+            runSendLoop()
+            return@rememberLauncherForActivityResult
+        }
+
+        // Branch 2 — detection pre-processing on IO. Progress reflected
+        // in the Library header via preprocessDone / preprocessTotal.
+        scope.launch {
+            // Wipe any leftover temp crops from a previous (possibly
+            // crashed) session so the cache doesn't accumulate forever.
+            withContext(Dispatchers.IO) {
+                FolderUploadProcessor.cropsDir(context).listFiles()?.forEach {
+                    runCatching { it.delete() }
+                }
+            }
+            preprocessTotal = imageFiles.size
+            preprocessDone = 0
+            preprocessLabel = "Analyzing images"
+            val queue = mutableListOf<LibraryItem>()
+            val now = System.currentTimeMillis() / 1000
+
+            for ((index, file) in imageFiles.withIndex()) {
+                preprocessDone = index
+                preprocessLabel = "Analyzing ${file.name}"
+                val srcUri = file.uri
+                val srcName = file.name ?: "receipt.jpg"
+                val result = withContext(Dispatchers.Default) {
+                    FolderUploadProcessor.process(context, srcUri)
+                }
+                when (result) {
+                    is FolderUploadProcessor.Result.Detected -> {
+                        for (crop in result.crops) {
+                            queue += LibraryItem(
+                                uri = Uri.fromFile(crop.tempFile),
+                                name = crop.displayName,
+                                dateAddedSec = now,
+                                moveAfterSend = true,
+                                sourceUri = srcUri,
+                                sourceName = srcName,
+                                pdfMaxWidthPx = PdfMaker.FOLDER_UPLOAD_MAX_WIDTH_PX,
+                            )
+                        }
+                    }
+                    is FolderUploadProcessor.Result.NoReceipts,
+                    is FolderUploadProcessor.Result.LoadFailed -> {
+                        withContext(Dispatchers.IO) {
+                            runCatching {
+                                CoupaUploadsFolder.moveToFailed(context, srcUri, srcName)
+                            }
+                        }
+                    }
+                }
+            }
+            preprocessDone = imageFiles.size
+            preprocessTotal = 0
+            preprocessDone = 0
+            preprocessLabel = null
+
+            if (queue.isEmpty()) {
+                Toast.makeText(
+                    context,
+                    "No receipts identified. Unrecognized images moved to " +
+                        "Pictures/Failed Coupa Uploads.",
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@launch
+            }
+            sendQueue = queue
+            runSendLoop()
+        }
     }
 
     fun performDelete() {
@@ -381,6 +535,9 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
             sentCount = sentCount,
             sendInFlight = sendInFlight,
             sendError = sendError,
+            preprocessDone = preprocessDone,
+            preprocessTotal = preprocessTotal,
+            preprocessLabel = preprocessLabel,
             onCancelSelect = { selected = emptySet() },
             onStartSend = ::beginSend,
             onClearQueue = {
@@ -528,6 +685,9 @@ private fun Header(
     sentCount: Int,
     sendInFlight: Boolean,
     sendError: String?,
+    preprocessDone: Int,
+    preprocessTotal: Int,
+    preprocessLabel: String?,
     onCancelSelect: () -> Unit,
     onStartSend: () -> Unit,
     onClearQueue: () -> Unit,
@@ -537,6 +697,31 @@ private fun Header(
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         when {
+            preprocessTotal > 0 -> {
+                Text(
+                    text = preprocessLabel ?: "Analyzing images",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "${preprocessDone + 1} of $preprocessTotal · detecting receipts, " +
+                        "cropping, reading date/location",
+                    color = Color.White.copy(alpha = 0.7f),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+                androidx.compose.material3.LinearProgressIndicator(
+                    progress = {
+                        if (preprocessTotal <= 0) 0f
+                        else (preprocessDone.toFloat() / preprocessTotal).coerceIn(0f, 1f)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                )
+            }
+
             sendError != null -> {
                 Text(
                     text = "Coupa send failed",

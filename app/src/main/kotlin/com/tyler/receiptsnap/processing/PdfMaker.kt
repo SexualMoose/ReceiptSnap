@@ -46,48 +46,60 @@ object PdfMaker {
     private const val MIN_PAGE_H_PT = 396f   // half-Letter floor for very short receipts
     private const val MARGIN_PT = 12f
 
-    // Cap the WIDTH, not the longest side. Receipt widths are fairly
-    // consistent (thermal roll is typically ~80 mm) but length varies
-    // enormously — capping max-side would squeeze text on long receipts
-    // until it becomes illegible. Capping width preserves text pixel
-    // density on every receipt at the cost of a slightly larger file
-    // for unusually long ones.
+    // Default width cap. Callers can override via makePdf(maxWidth=…)
+    // for higher-quality folder uploads where the source may be a
+    // variable-quality photo we didn't take ourselves. See
+    // LibraryScreen's folder-upload path for the higher-width variant.
     //
-    // 1000 px across 80 mm yields ~317 DPI, enough that 10 pt body text
-    // is ~35 px tall (2× ML Kit's reliable-recognition threshold) and
-    // even 5 pt fine-print terms are ~18 px (above the threshold). Below
-    // 800 px, fine-print OCR starts to miss.
-    private const val MAX_WIDTH_PX = 1000
+    // 1000 px across 80 mm thermal roll yields ~317 DPI, enough that
+    // 10 pt body text is ~35 px tall (2× ML Kit's reliable-recognition
+    // threshold) and 5 pt fine print is ~18 px (above threshold).
+    const val DEFAULT_MAX_WIDTH_PX = 1000
+
+    /** Wider cap used for folder uploads whose source images may be
+     *  lower-quality photos than our own captures — keeps more pixels
+     *  to preserve legibility. */
+    const val FOLDER_UPLOAD_MAX_WIDTH_PX = 1600
+
     private const val JPEG_QUALITY = 72     // moderate compression, still crisp
 
     /** Output directory for generated PDFs; paired with file_paths.xml. */
     fun outputDir(context: Context): File =
         File(context.cacheDir, "coupa_pdfs").apply { mkdirs() }
 
-    fun makePdf(context: Context, imageUri: Uri, outputDir: File, baseName: String): File {
+    fun makePdf(
+        context: Context,
+        imageUri: Uri,
+        outputDir: File,
+        baseName: String,
+        maxWidthPx: Int = DEFAULT_MAX_WIDTH_PX,
+        jpegQuality: Int = JPEG_QUALITY,
+        desaturate: Boolean = true,
+    ): File {
         val safeName = baseName.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "receipt" }
         val outFile = File(outputDir, "$safeName.pdf")
 
-        val color = loadBitmap(context, imageUri)
+        val color = loadBitmap(context, imageUri, maxWidthPx)
             ?: error("Could not decode $imageUri")
 
-        val gray = try {
-            desaturate(color)
-        } finally {
-            color.recycle()
-        }
+        val processed = try {
+            if (desaturate) desaturate(color) else color
+        } catch (t: Throwable) { color.recycle(); throw t }
 
-        // Capture dimensions before recycling — we still need them for the
-        // PDF's image-XObject header.
-        val bmpW = gray.width
-        val bmpH = gray.height
+        // When we desaturated, `processed` is a new bitmap; otherwise it's
+        // the same object. Handle recycle carefully.
+        val ownsProcessed = processed !== color
+        if (ownsProcessed) color.recycle()
+
+        val bmpW = processed.width
+        val bmpH = processed.height
 
         val jpegBytes = try {
             ByteArrayOutputStream().also { out ->
-                gray.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                processed.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
             }.toByteArray()
         } finally {
-            gray.recycle()
+            processed.recycle()
         }
 
         FileOutputStream(outFile).use { os ->
@@ -96,46 +108,124 @@ object PdfMaker {
         Log.i(
             "PdfMaker",
             "Wrote ${outFile.name}: ${outFile.length() / 1024} KB " +
-                "(jpeg ${jpegBytes.size / 1024} KB, ${bmpW}×${bmpH})",
+                "(jpeg ${jpegBytes.size / 1024} KB, ${bmpW}×${bmpH}, q=$jpegQuality, gray=$desaturate)",
         )
         return outFile
     }
 
+    /**
+     * Passthrough mode: embed the source bytes directly in a PDF with NO
+     * re-encoding or downscaling. For JPEGs this is true passthrough
+     * (original bytes land in the PDF stream). For PNG/WebP we decode and
+     * re-encode once at near-lossless quality to get bytes the PDF reader
+     * can consume via DCTDecode.
+     *
+     * Used for user-initiated re-upload from the Failed Coupa Uploads
+     * folder — we preserve the picture as-is.
+     */
+    fun makePdfPassthrough(
+        context: Context,
+        imageUri: Uri,
+        outputDir: File,
+        baseName: String,
+    ): File {
+        val safeName = baseName.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "receipt" }
+        val outFile = File(outputDir, "$safeName.pdf")
+
+        val resolver = context.contentResolver
+        val mime = resolver.getType(imageUri) ?: ""
+
+        if (mime == "image/jpeg" || mime.endsWith("/jpeg")) {
+            val rawBytes = resolver.openInputStream(imageUri)?.use { it.readBytes() }
+                ?: error("Could not read $imageUri")
+            val (w, h) = readJpegDimensions(rawBytes)
+                ?: error("Could not read JPEG dimensions for $imageUri")
+            FileOutputStream(outFile).use { os ->
+                writePdf(os, rawBytes, w, h)
+            }
+            Log.i(
+                "PdfMaker",
+                "Passthrough ${outFile.name}: ${outFile.length() / 1024} KB (JPEG bytes untouched, ${w}×${h})",
+            )
+            return outFile
+        }
+
+        // Non-JPEG input: decode at native size, re-encode once at high quality.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(imageUri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+        val decoded = resolver.openInputStream(imageUri)?.use {
+            BitmapFactory.decodeStream(it, null, opts)
+        } ?: error("Could not decode $imageUri")
+
+        val w = decoded.width
+        val h = decoded.height
+        val jpegBytes = try {
+            ByteArrayOutputStream().also { out ->
+                decoded.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }.toByteArray()
+        } finally { decoded.recycle() }
+
+        FileOutputStream(outFile).use { os ->
+            writePdf(os, jpegBytes, w, h)
+        }
+        Log.i(
+            "PdfMaker",
+            "Passthrough ${outFile.name}: ${outFile.length() / 1024} KB (re-encoded q=95, ${w}×${h})",
+        )
+        return outFile
+    }
+
+    /** Minimal JPEG SOF-marker parser. Walks the JPEG segments until it
+     *  hits a Start-Of-Frame (C0..CF, excluding DHT/JPG/DAC) which carries
+     *  width/height. Fast and dependency-free. */
+    private fun readJpegDimensions(bytes: ByteArray): Pair<Int, Int>? {
+        if (bytes.size < 4 || bytes[0] != 0xFF.toByte() || bytes[1] != 0xD8.toByte()) return null
+        var i = 2
+        while (i + 4 < bytes.size) {
+            if (bytes[i] != 0xFF.toByte()) return null
+            // Skip any fill bytes (0xFF padding)
+            while (i < bytes.size && bytes[i] == 0xFF.toByte()) i++
+            if (i >= bytes.size) return null
+            val marker = bytes[i].toInt() and 0xFF
+            i++
+            if (marker == 0xD9 || marker == 0xDA) return null // EOI or SOS before SOF
+            val segLen = ((bytes[i].toInt() and 0xFF) shl 8) or (bytes[i + 1].toInt() and 0xFF)
+            // SOF0..SOF15, but exclude 0xC4 (DHT), 0xC8 (JPG), 0xCC (DAC)
+            if (marker in 0xC0..0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+                val h = ((bytes[i + 3].toInt() and 0xFF) shl 8) or (bytes[i + 4].toInt() and 0xFF)
+                val w = ((bytes[i + 5].toInt() and 0xFF) shl 8) or (bytes[i + 6].toInt() and 0xFF)
+                return w to h
+            }
+            i += segLen
+        }
+        return null
+    }
+
     // --- bitmap prep --------------------------------------------------------
 
-    private fun loadBitmap(context: Context, uri: Uri): Bitmap? {
+    private fun loadBitmap(context: Context, uri: Uri, maxWidthPx: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, bounds)
         }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
-        // Two-step scale: first use inSampleSize to get reasonably close
-        // without decoding the full-size bitmap, then createScaledBitmap
-        // for an exact width match. inSampleSize only supports powers of
-        // two, so we stop halving once the decoded width would no longer
-        // safely exceed our target.
         var sample = 1
-        while (bounds.outWidth / (sample * 2) > MAX_WIDTH_PX) sample *= 2
+        while (bounds.outWidth / (sample * 2) > maxWidthPx) sample *= 2
 
         val opts = BitmapFactory.Options().apply {
             inSampleSize = sample
-            // RGB_565 halves the decoded-bitmap RAM compared to ARGB_8888.
-            // Once desaturated and JPEG-compressed, the output is identical
-            // for our purposes.
             inPreferredConfig = Bitmap.Config.RGB_565
         }
         val decoded = context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, opts)
         } ?: return null
 
-        if (decoded.width <= MAX_WIDTH_PX) return decoded
+        if (decoded.width <= maxWidthPx) return decoded
 
-        // Width still over target after inSampleSize — scale precisely.
-        // Height scales proportionally so aspect ratio is preserved for
-        // long receipts (a 3:1 receipt stays 3:1; a 10:1 stays 10:1).
-        val newW = MAX_WIDTH_PX
-        val newH = ((MAX_WIDTH_PX.toLong() * decoded.height) / decoded.width).toInt()
+        val newW = maxWidthPx
+        val newH = ((maxWidthPx.toLong() * decoded.height) / decoded.width).toInt()
             .coerceAtLeast(1)
         val scaled = Bitmap.createScaledBitmap(decoded, newW, newH, true)
         if (scaled !== decoded) decoded.recycle()

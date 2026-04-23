@@ -10,27 +10,43 @@ import android.provider.MediaStore
 import android.util.Log
 
 /**
- * Moves a just-uploaded external receipt into `Pictures/Coupa Uploads/` so
- * the user has a clean "already sent" archive separate from their input
- * folder. Used only for the folder-upload path; in-app captures already
- * live under `Pictures/ReceiptSnap/`.
+ * Helpers for routing external-upload receipts into per-outcome archive
+ * folders under `Pictures/`:
  *
- * Creates the destination directory automatically via MediaStore
- * RELATIVE_PATH (Android Q+) or a plain mkdirs() on legacy builds.
+ *   `Pictures/Coupa Uploads/`         — successfully sent to Coupa
+ *   `Pictures/Failed Coupa Uploads/`  — image we couldn't identify as a
+ *                                       receipt (no DocumentDetector hit)
  *
- * On any failure we keep the source intact — partial success (copied but
- * didn't delete) leaves the user with the file in both places, which is
- * better than losing it.
+ * MediaStore auto-creates the destination directory on Android Q+. On
+ * legacy builds we mkdirs() before inserting.
+ *
+ * Partial-success safety: if the copy stream fails we roll back the
+ * MediaStore placeholder so the gallery doesn't show an empty row. If
+ * we successfully copied but couldn't delete the source, we keep both
+ * — a dup is better than losing a receipt.
  */
 object CoupaUploadsFolder {
 
     private const val TAG = "CoupaUploadsFolder"
-    private const val RELATIVE_DIR = "Pictures/Coupa Uploads"
 
-    fun moveToArchive(
+    const val COUPA_UPLOADS_DIR = "Pictures/Coupa Uploads"
+    const val FAILED_UPLOADS_DIR = "Pictures/Failed Coupa Uploads"
+
+    /** Folder display name that activates passthrough-re-upload mode when
+     *  a user picks it via the SAF tree picker. */
+    const val FAILED_UPLOADS_FOLDER_NAME = "Failed Coupa Uploads"
+
+    fun moveToArchive(context: Context, sourceUri: Uri, displayName: String): Boolean =
+        moveToDir(context, sourceUri, displayName, COUPA_UPLOADS_DIR)
+
+    fun moveToFailed(context: Context, sourceUri: Uri, displayName: String): Boolean =
+        moveToDir(context, sourceUri, displayName, FAILED_UPLOADS_DIR)
+
+    private fun moveToDir(
         context: Context,
         sourceUri: Uri,
         displayName: String,
+        relativeDir: String,
     ): Boolean {
         val resolver = context.contentResolver
         val mime = mimeFromName(displayName)
@@ -39,14 +55,15 @@ object CoupaUploadsFolder {
             put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
             put(MediaStore.Images.Media.MIME_TYPE, mime)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, RELATIVE_DIR)
+                put(MediaStore.Images.Media.RELATIVE_PATH, relativeDir)
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             } else {
                 @Suppress("DEPRECATION")
                 val pictures = Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_PICTURES
                 )
-                val dir = java.io.File(pictures, "Coupa Uploads").apply { mkdirs() }
+                val subDir = relativeDir.removePrefix("Pictures/")
+                val dir = java.io.File(pictures, subDir).apply { mkdirs() }
                 put(
                     MediaStore.Images.Media.DATA,
                     java.io.File(dir, displayName).absolutePath,
@@ -59,7 +76,7 @@ object CoupaUploadsFolder {
         else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
 
         val destUri = resolver.insert(collection, values) ?: run {
-            Log.w(TAG, "insert returned null for $displayName")
+            Log.w(TAG, "insert returned null ($relativeDir / $displayName)")
             return false
         }
 
@@ -76,8 +93,6 @@ object CoupaUploadsFolder {
         }
 
         if (!copied) {
-            // Clean up the placeholder MediaStore row so we don't leave an
-            // empty "Coupa Uploads" entry in the user's gallery.
             runCatching { resolver.delete(destUri, null, null) }
             return false
         }
@@ -89,17 +104,13 @@ object CoupaUploadsFolder {
             runCatching { resolver.update(destUri, finalize, null, null) }
         }
 
-        // Now attempt to delete the source. The tree-picker gave us R/W
-        // permission, so this should succeed — but if it doesn't (e.g., the
-        // file was removed externally during the send) we still count the
-        // move as a partial success because the archive copy is in place.
         val sourceDeleted = try {
             DocumentsContract.deleteDocument(resolver, sourceUri)
         } catch (t: Throwable) {
             Log.w(TAG, "source delete failed for $sourceUri", t); false
         }
         if (!sourceDeleted) {
-            Log.w(TAG, "Archived $displayName but couldn't delete source $sourceUri")
+            Log.w(TAG, "Archived $displayName to $relativeDir but couldn't delete source $sourceUri")
         }
         return true
     }

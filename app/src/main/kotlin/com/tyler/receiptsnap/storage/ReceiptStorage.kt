@@ -95,6 +95,11 @@ object ReceiptStorage {
         out.flush()
     }
 
+    /** Public variant for callers (e.g. folder-upload pre-processing) that
+     *  need the same naming convention but write to their own destination. */
+    fun buildDisplayName(date: LocalDate?, location: String?, isMeal: Boolean): String =
+        buildBaseName(date, location, isMeal)
+
     private fun buildBaseName(date: LocalDate?, location: String?, isMeal: Boolean): String {
         val sanitizedLoc = location?.let(::sanitize)?.takeIf { it.isNotBlank() }
         val dateStr = date?.let(ReceiptParser::formatDateForFilename)
