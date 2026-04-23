@@ -58,6 +58,10 @@ object DocumentDetector {
     private const val WORK_MAX_SIDE_OCR = 4000
     private const val WORK_MAX_SIDE_EDGES = 1600
 
+    /** When pass-1 full-frame OCR returns fewer than this many lines, run the
+     *  tile-and-upscale second pass to pick up smaller text. */
+    private const val FULL_FRAME_SUFFICIENT_LINES = 60
+
     // Linking tolerances for single-link clustering. Loose enough that a
     // receipt with blank sections and slight baseline curl stays one cluster.
     private const val ANGLE_TOLERANCE_RAD = 10.0 * PI / 180.0
@@ -214,32 +218,107 @@ object DocumentDetector {
         val medianHeight: Double,
     )
 
+    /**
+     * OCR the full capture, then — when the first pass yields few lines (a
+     * typical symptom of a far-away or low-detail receipt photographed at a
+     * distance) — tile the original into overlapping crops, upscale each 2×,
+     * and OCR them individually. Upscaling effectively doubles the pixel
+     * height of printed text, which is what ML Kit's text recognizer is
+     * most sensitive to.
+     *
+     * Samsung caps third-party capture at 12.5 MP on this device, so the
+     * tile+upscale pass is the only way we can recover detail when the
+     * camera was a meter or more from the receipt.
+     */
     private suspend fun recognizeLines(source: Bitmap): List<LineInfo> {
-        val maxSide = max(source.width, source.height)
-        val scale: Double = if (maxSide > WORK_MAX_SIDE_OCR) WORK_MAX_SIDE_OCR.toDouble() / maxSide else 1.0
-        val scaled = if (scale < 1.0) {
-            Bitmap.createScaledBitmap(
-                source,
-                (source.width * scale).toInt(),
-                (source.height * scale).toInt(),
-                true,
-            )
-        } else source
-        Log.i(TAG, "OCR input ${scaled.width}×${scaled.height} (scale=${"%.3f".format(scale)})")
+        val pass1 = ocrRegion(source, 0, 0, source.width, source.height, 1.0)
+        Log.i(TAG, "Pass 1 (full-frame) returned ${pass1.size} lines")
+        if (pass1.size >= FULL_FRAME_SUFFICIENT_LINES) return pass1
 
-        val text = runOcr(scaled)
-        if (scaled !== source) scaled.recycle()
+        val tileLines = ocrTiled(source)
+        val combined = pass1 + tileLines
+        Log.i(TAG, "Pass 1+tile returned ${combined.size} lines total")
+        return combined
+    }
 
-        val invScale = 1.0 / scale
+    private suspend fun ocrTiled(source: Bitmap): List<LineInfo> {
+        val cols = 3; val rows = 2
+        val overlapRatio = 0.25
+        // Base tile footprint before overlap. The resulting tiles overlap so
+        // a receipt straddling a seam still appears intact in at least one
+        // tile.
+        val baseTileW = source.width / (cols - overlapRatio * (cols - 1))
+        val baseTileH = source.height / (rows - overlapRatio * (rows - 1))
+        val tileW = baseTileW.toInt().coerceAtMost(source.width)
+        val tileH = baseTileH.toInt().coerceAtMost(source.height)
+        val stepX = (baseTileW * (1 - overlapRatio)).toInt().coerceAtLeast(1)
+        val stepY = (baseTileH * (1 - overlapRatio)).toInt().coerceAtLeast(1)
+
+        val out = mutableListOf<LineInfo>()
+        var idx = 0
+        for (row in 0 until rows) for (col in 0 until cols) {
+            val x = (col * stepX).coerceAtMost(source.width - tileW)
+            val y = (row * stepY).coerceAtMost(source.height - tileH)
+            // 2× upscale: OCR operates on enlarged pixel data, so glyphs that
+            // were near the minimum recognizable size in the original are
+            // now comfortably above it.
+            val lines = ocrRegion(source, x, y, tileW, tileH, upscale = 2.0)
+            Log.i(TAG, "Tile[$idx] at ($x,$y) ${tileW}×${tileH} → ${lines.size} lines")
+            out += lines
+            idx++
+        }
+        return out
+    }
+
+    /**
+     * OCR a rectangular region of [source]. The returned LineInfo coordinates
+     * are always in the ORIGINAL bitmap's pixel space regardless of any
+     * internal scaling applied for ML Kit.
+     */
+    private suspend fun ocrRegion(
+        source: Bitmap,
+        srcX: Int, srcY: Int, srcW: Int, srcH: Int,
+        upscale: Double,
+    ): List<LineInfo> {
+        // 1) crop to the target rectangle
+        val cropped = if (srcX == 0 && srcY == 0 && srcW == source.width && srcH == source.height)
+            source
+        else Bitmap.createBitmap(source, srcX, srcY, srcW, srcH)
+
+        // 2) size for ML Kit — apply the caller's upscale and then cap so we
+        //    don't allocate a bitmap larger than ML Kit can process well
+        val targetW = (srcW * upscale).toInt().coerceAtLeast(1)
+        val targetH = (srcH * upscale).toInt().coerceAtLeast(1)
+        val scale: Double = when {
+            // If the upscaled target would exceed the safe max side, scale it
+            // back down a bit. We always go through createScaledBitmap because
+            // ML Kit recognizes better on properly bicubic-resampled input.
+            maxOf(targetW, targetH) > WORK_MAX_SIDE_OCR ->
+                WORK_MAX_SIDE_OCR.toDouble() / maxOf(targetW, targetH) * upscale
+            else -> upscale
+        }
+        val ocrW = (srcW * scale).toInt().coerceAtLeast(1)
+        val ocrH = (srcH * scale).toInt().coerceAtLeast(1)
+        val forOcr = if (ocrW == cropped.width && ocrH == cropped.height) cropped
+        else Bitmap.createScaledBitmap(cropped, ocrW, ocrH, true)
+
+        val text = runOcr(forOcr)
+
+        if (forOcr !== cropped) forOcr.recycle()
+        if (cropped !== source) cropped.recycle()
+
+        val inv = 1.0 / scale
         val out = mutableListOf<LineInfo>()
         for (block in text.textBlocks) {
             for (line in block.lines) {
                 val cp = line.cornerPoints ?: continue
                 if (cp.size != 4) continue
-                val tl = CvPoint(cp[0].x * invScale, cp[0].y * invScale)
-                val tr = CvPoint(cp[1].x * invScale, cp[1].y * invScale)
-                val br = CvPoint(cp[2].x * invScale, cp[2].y * invScale)
-                val bl = CvPoint(cp[3].x * invScale, cp[3].y * invScale)
+                // Transform OCR coords back to original-image coords:
+                // original = tileOffset + (ocrCoord * inv)
+                val tl = CvPoint(srcX + cp[0].x * inv, srcY + cp[0].y * inv)
+                val tr = CvPoint(srcX + cp[1].x * inv, srcY + cp[1].y * inv)
+                val br = CvPoint(srcX + cp[2].x * inv, srcY + cp[2].y * inv)
+                val bl = CvPoint(srcX + cp[3].x * inv, srcY + cp[3].y * inv)
                 val angle = atan2(tr.y - tl.y, tr.x - tl.x)
                 val height = (distance(tl, bl) + distance(tr, br)) / 2.0
                 val width = (distance(tl, tr) + distance(bl, br)) / 2.0
