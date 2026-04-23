@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +42,7 @@ import com.tyler.receiptsnap.camera.CameraScreen
 import com.tyler.receiptsnap.ui.LibraryScreen
 import com.tyler.receiptsnap.ui.MainViewModel
 import com.tyler.receiptsnap.ui.ReviewScreen
+import com.tyler.receiptsnap.ui.SettingsScreen
 import com.tyler.receiptsnap.ui.theme.ReceiptSnapTheme
 
 class MainActivity : ComponentActivity() {
@@ -60,7 +62,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Tab(val label: String) { Capture("Capture"), Library("Library") }
+private enum class Tab(val label: String) { Capture("Capture"), Library("Library"), Settings("Settings") }
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
@@ -109,6 +111,7 @@ private fun Root(viewModel: MainViewModel) {
                     onCapture = viewModel::capture,
                 )
                 Tab.Library -> LibraryScreen()
+                Tab.Settings -> SettingsScreen()
             }
         }
     }
@@ -126,6 +129,7 @@ private fun BottomNav(current: Tab, onSelect: (Tab) -> Unit) {
                         imageVector = when (t) {
                             Tab.Capture -> Icons.Default.CameraAlt
                             Tab.Library -> Icons.Default.PhotoLibrary
+                            Tab.Settings -> Icons.Default.Settings
                         },
                         contentDescription = t.label,
                     )
