@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ReceiptSnap</string>
+    <string name="capture">Capture</string>
+    <string name="permission_required">Camera permission is required</string>
+    <string name="grant_permission">Grant permission</string>
+    <string name="processing">Processing…</string>
+    <string name="saved_count">Saved %1$d receipts</string>
+</resources>

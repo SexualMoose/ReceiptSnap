@@ -1,0 +1,4 @@
+-keep class org.opencv.** { *; }
+-keep class com.google.mlkit.** { *; }
+-keep class com.google.android.gms.** { *; }
+-dontwarn org.opencv.**
