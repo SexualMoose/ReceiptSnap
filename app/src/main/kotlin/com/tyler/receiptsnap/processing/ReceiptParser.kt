@@ -79,12 +79,29 @@ object ReceiptParser {
         DatePattern(Regex("\\b(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2})\\b"), DateStyle.Iso),
         DatePattern(Regex("\\b(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{4})\\b"), DateStyle.SlashFourY),
         DatePattern(Regex("\\b(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{2})\\b"), DateStyle.SlashTwoY),
+        // Month-leading with optional ordinal suffix: DEC 13th 2024,
+        // NOV 29th 25, JANUARY 3rd 2023, JAN 03 25, JAN-03-25 …
+        // The month-name group accepts abbreviated (Jan/Sept/etc) or full
+        // name via a greedy letter tail. Separator is space, comma, hyphen,
+        // dot, or slash. Ordinal suffix (st/nd/rd/th) is optional and not
+        // captured — we only care about the numeric day value.
         DatePattern(
-            Regex("\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.?\\s+(\\d{1,2}),?\\s+(\\d{2,4})\\b", RegexOption.IGNORE_CASE),
+            Regex(
+                "\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.?" +
+                    "[\\s,./-]+(\\d{1,2})(?:st|nd|rd|th)?[\\s,./-]+(\\d{2,4})\\b",
+                RegexOption.IGNORE_CASE,
+            ),
             DateStyle.MonthLead,
         ),
+        // Day-leading with optional ordinal suffix: 03 NOV 24, 04 DEC 2025,
+        // 13th NOV 2024 …
         DatePattern(
-            Regex("\\b(\\d{1,2})\\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.?\\s+(\\d{2,4})\\b", RegexOption.IGNORE_CASE),
+            Regex(
+                "\\b(\\d{1,2})(?:st|nd|rd|th)?[\\s,./-]+" +
+                    "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\\.?" +
+                    "[\\s,./-]+(\\d{2,4})\\b",
+                RegexOption.IGNORE_CASE,
+            ),
             DateStyle.DayLead,
         ),
     )
@@ -97,15 +114,27 @@ object ReceiptParser {
     fun detectDateInText(text: String): LocalDate? = allDatesInText(text).firstOrNull()
 
     /** Returns *every* plausible date match in `text`, deduplicated. Used by
-     *  the receipt validity test so we can enforce "exactly one date". */
+     *  the receipt validity test so we can enforce "exactly one date".
+     *
+     *  Future dates are filtered out — a receipt dated after today is
+     *  almost always OCR noise (e.g. a phone number or account number
+     *  mis-parsed as a date). The caller should look for another match
+     *  on the same receipt before giving up. */
     fun allDatesInText(text: String): List<LocalDate> {
+        val today = java.time.LocalDate.now()
         val lines = text.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
         val out = linkedSetOf<LocalDate>()
         for (line in lines) {
             for (pattern in DATE_PATTERNS) {
-                val m = pattern.regex.find(line) ?: continue
-                val parsed = parseMatch(pattern, m) ?: continue
-                if (parsed.year in 1990..2099) out += parsed
+                // findAll (not find) so a single line with two dates —
+                // "21-04-2026 Time: 12:07:57" followed by "DEC 13th 2024"
+                // in a duplicate receipt — both get captured.
+                for (match in pattern.regex.findAll(line)) {
+                    val parsed = parseMatch(pattern, match) ?: continue
+                    if (parsed.year !in 1990..2099) continue
+                    if (parsed.isAfter(today)) continue
+                    out += parsed
+                }
             }
         }
         return out.toList()
