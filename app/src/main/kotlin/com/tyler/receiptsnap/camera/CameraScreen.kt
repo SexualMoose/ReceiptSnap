@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CameraAlt
@@ -59,7 +60,11 @@ fun CameraScreen(
             factory = { ctx ->
                 PreviewView(ctx).apply {
                     scaleType = PreviewView.ScaleType.FILL_CENTER
-                    implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+                    // COMPATIBLE uses TextureView, which renders into the
+                    // regular view hierarchy — SurfaceView (PERFORMANCE)
+                    // can z-order under sibling Compose overlays on some
+                    // OEMs, hiding our quality badge.
+                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                 }.also { previewViewState.value = it }
             },
         )
@@ -72,7 +77,11 @@ fun CameraScreen(
             quality = quality,
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(start = 12.dp, top = 16.dp),
+                // statusBarsPadding so the pill clears the system status
+                // bar — the rest of the screen is edge-to-edge so without
+                // this the badge tucks underneath and isn't visible.
+                .statusBarsPadding()
+                .padding(start = 12.dp, top = 8.dp),
         )
 
         LaunchedEffect(previewViewState.value) {
