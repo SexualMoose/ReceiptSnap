@@ -87,6 +87,33 @@ class CameraController(private val context: Context) {
     private val _previewQuality = kotlinx.coroutines.flow.MutableStateFlow(PreviewQuality())
     val previewQuality: kotlinx.coroutines.flow.StateFlow<PreviewQuality> = _previewQuality
 
+    /**
+     * Best-yet metadata observed across preview frames during this session.
+     * Updated by the same analyzer that powers [previewQuality] — every
+     * preview frame with an OCR result feeds its detected date / total /
+     * location into this cache, keeping the most recent non-null value.
+     *
+     * The send-time fallback (in MainViewModel.commitReview) consults this
+     * when a per-receipt warp+OCR misses a field. Only applied when the
+     * captured frame contains a single receipt — multi-receipt frames
+     * could mix metadata across receipts otherwise.
+     */
+    data class FrameMetadata(
+        val date: java.time.LocalDate? = null,
+        val total: com.tyler.receiptsnap.processing.ReceiptParser.Total? = null,
+        val location: String? = null,
+        val updatedMs: Long = 0L,
+    )
+
+    private val _bestMetadata = kotlinx.coroutines.flow.MutableStateFlow(FrameMetadata())
+    val bestMetadata: kotlinx.coroutines.flow.StateFlow<FrameMetadata> = _bestMetadata
+
+    /** Reset the metadata cache. Call after a capture is fully committed
+     *  so the next session starts from scratch. */
+    fun resetMetadataCache() {
+        _bestMetadata.value = FrameMetadata()
+    }
+
     /** Throttle: ML Kit calls are ~150-300 ms each. Skip frames in between
      *  so the analyzer doesn't pile up. */
     @Volatile private var lastAnalysisAtMs = 0L
@@ -154,11 +181,13 @@ class CameraController(private val context: Context) {
         val total = 1 + secondaryOrder.size
         val frames = mutableListOf<CapturedFrame>()
 
-        // Primary — preview is already bound to this lens.
-        onProgress?.invoke(0, total, primary.kind.name)
-        runCatching { captureOnce() }
+        // Primary — burst-of-3 with sharpest pick. Preview is already
+        // bound to this lens. Burst on secondary lenses isn't worth the
+        // ~2× rebind overhead per lens; the primary is what matters most.
+        onProgress?.invoke(0, total, "${primary.kind.name} (burst)")
+        runCatching { captureBurst(PRIMARY_BURST_COUNT) }
             .onSuccess { frames += CapturedFrame(it, primary) }
-            .onFailure { Log.e(TAG, "Primary capture failed on ${primary.kind}", it) }
+            .onFailure { Log.e(TAG, "Primary burst capture failed on ${primary.kind}", it) }
 
         // Secondary / tertiary — rebind briefly, capture, rebind back.
         for ((i, lens) in secondaryOrder.withIndex()) {
@@ -180,6 +209,75 @@ class CameraController(private val context: Context) {
 
     /** Backwards-compatible single-shot capture for the primary lens. */
     suspend fun capture(): Bitmap = captureOnce()
+
+    /**
+     * Burst-of-N capture: fire [count] takePicture calls in quick
+     * succession, score each by Laplacian-variance sharpness, return the
+     * sharpest frame. Other frames are recycled. Substantially better
+     * than a single shot for receipts because hand jitter and auto-focus
+     * walk produce one or two frames noticeably crisper than the rest.
+     */
+    suspend fun captureBurst(count: Int): Bitmap {
+        if (count <= 1) return captureOnce()
+        val frames = mutableListOf<Bitmap>()
+        repeat(count) {
+            try {
+                frames += captureOnce()
+            } catch (t: Throwable) {
+                Log.w(TAG, "burst frame failed", t)
+            }
+        }
+        if (frames.isEmpty()) error("All burst frames failed")
+        if (frames.size == 1) return frames.single()
+
+        val scored = frames.map { it to sharpnessVariance(it) }
+        val best = scored.maxBy { it.second }
+        Log.i(
+            TAG,
+            "Burst of ${frames.size}: scores=${scored.map { "%.0f".format(it.second) }} → " +
+                "winner ${best.first.width}×${best.first.height}",
+        )
+        for ((frame, _) in scored) if (frame !== best.first) frame.recycle()
+        return best.first
+    }
+
+    /** Variance of the Laplacian on a downscaled grayscale copy — the
+     *  standard "no-reference" sharpness metric. Higher = sharper. We
+     *  downscale to ~800 px max side first because the metric works fine
+     *  at that resolution and a 12.5 MP Laplacian costs ~1 second. */
+    private fun sharpnessVariance(bitmap: Bitmap): Double {
+        val maxSide = 800
+        val maxDim = maxOf(bitmap.width, bitmap.height)
+        val scale = if (maxDim > maxSide) maxSide.toDouble() / maxDim else 1.0
+        val small = if (scale < 1.0) {
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).toInt(),
+                (bitmap.height * scale).toInt(),
+                true,
+            )
+        } else bitmap
+        return try {
+            val mat = org.opencv.core.Mat()
+            org.opencv.android.Utils.bitmapToMat(small, mat)
+            val gray = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.cvtColor(mat, gray, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            val lap = org.opencv.core.Mat()
+            org.opencv.imgproc.Imgproc.Laplacian(gray, lap, org.opencv.core.CvType.CV_64F)
+            val mean = org.opencv.core.MatOfDouble()
+            val stddev = org.opencv.core.MatOfDouble()
+            org.opencv.core.Core.meanStdDev(lap, mean, stddev)
+            val sigma = stddev.toArray().firstOrNull() ?: 0.0
+            mat.release(); gray.release(); lap.release()
+            mean.release(); stddev.release()
+            sigma * sigma
+        } catch (t: Throwable) {
+            Log.w(TAG, "sharpness scoring failed; treating as 0", t)
+            0.0
+        } finally {
+            if (small !== bitmap) small.recycle()
+        }
+    }
 
     fun release() {
         executor.shutdown()
@@ -233,6 +331,27 @@ class CameraController(private val context: Context) {
                         else -> QualityLevel.Poor
                     }
                     _previewQuality.value = PreviewQuality(lineCount, luma, level)
+
+                    // Feed the metadata cache so capture-time fallback has
+                    // a chance even when the captured frame's per-receipt
+                    // OCR misses a field. Only update fields with new
+                    // non-null observations — never overwrite a real value
+                    // with null.
+                    if (lineCount > 0) {
+                        val text = result.text
+                        val date = com.tyler.receiptsnap.processing.ReceiptParser.detectDateInText(text)
+                        val total = com.tyler.receiptsnap.processing.ReceiptParser.detectTotal(text)
+                        val location = com.tyler.receiptsnap.processing.AddressParser.extractLocation(text)
+                        val current = _bestMetadata.value
+                        if (date != null || total != null || location != null) {
+                            _bestMetadata.value = FrameMetadata(
+                                date = date ?: current.date,
+                                total = total ?: current.total,
+                                location = location ?: current.location,
+                                updatedMs = System.currentTimeMillis(),
+                            )
+                        }
+                    }
                 }
                 .addOnFailureListener { /* keep prior reading on transient errors */ }
                 .addOnCompleteListener { proxy.close() }
@@ -439,5 +558,11 @@ class CameraController(private val context: Context) {
 
     private companion object {
         const val TAG = "CameraController"
+
+        /** Burst size for the primary lens. 3 hits the sweet spot — most
+         *  hand-jitter variance is captured, and the extra ~1 s of capture
+         *  time is a fair trade for noticeably sharper frames. Going to 5
+         *  rarely produces a winner the top-3 didn't already include. */
+        const val PRIMARY_BURST_COUNT = 3
     }
 }

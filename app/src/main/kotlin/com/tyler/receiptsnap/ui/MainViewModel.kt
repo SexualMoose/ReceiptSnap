@@ -39,6 +39,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val secondaries: List<SecondaryFrame>,
             val quads: List<DocumentDetector.Quad>,
             val nextQuadId: Long,
+            /** Best-yet metadata observed during preview leading up to
+             *  capture — date / total / location seen across the live
+             *  analyzer's frames. Used as fallback when per-receipt OCR
+             *  on a warped crop misses a field. Only safe to apply when
+             *  the captured frame yields exactly one receipt; with
+             *  multiple receipts the cache could mix metadata. */
+            val previewMetadata: CameraController.FrameMetadata =
+                CameraController.FrameMetadata(),
         ) : Phase
 
         data class SecondaryFrame(
@@ -127,6 +135,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     secondaries = secondaries,
                     quads = quads,
                     nextQuadId = (quads.maxOfOrNull { it.id } ?: 0L) + 1,
+                    // Snapshot the analyzer cache at capture time so a
+                    // later tap-to-add (which keeps preview running) can't
+                    // poison the metadata used for the receipts we already
+                    // detected.
+                    previewMetadata = controller.bestMetadata.value,
                 ),
                 busy = false,
                 status = if (quads.isEmpty())
@@ -345,14 +358,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val info = runCatching { ReceiptParser.parse(cropped) }
                     .getOrElse { ReceiptParser.Info(null, null, false, null, "") }
 
+                // Single-receipt frames get the preview-time metadata
+                // cache as a fallback for any field per-crop OCR missed.
+                // For multi-receipt frames we skip the fallback because
+                // the cache is whole-frame and could mix metadata across
+                // adjacent receipts.
+                val effective = if (toSave.size == 1) {
+                    val cache = phase.previewMetadata
+                    info.copy(
+                        date = info.date ?: cache.date,
+                        location = info.location ?: cache.location,
+                        total = info.total ?: cache.total,
+                    )
+                } else info
+
                 val result = runCatching {
                     ReceiptStorage.save(
                         context = getApplication(),
                         bitmap = cropped,
-                        date = info.date,
-                        location = info.location,
-                        isMeal = info.isMeal,
-                        total = info.total,
+                        date = effective.date,
+                        location = effective.location,
+                        isMeal = effective.isMeal,
+                        total = effective.total,
                     )
                 }.onFailure { Log.e(TAG, "Save failed", it) }.getOrNull()
 
