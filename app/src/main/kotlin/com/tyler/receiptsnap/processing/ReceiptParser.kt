@@ -25,8 +25,25 @@ object ReceiptParser {
         val date: LocalDate?,
         val location: String?,
         val isMeal: Boolean,
+        val total: Total?,
         val rawText: String,
     )
+
+    /** Total amount printed on the receipt. Pulled from a TOTAL/AMOUNT
+     *  DUE/BALANCE label whenever possible. [currencyCode] is null when
+     *  we couldn't infer a currency from symbols, ISO codes, or context. */
+    data class Total(
+        val amount: String,        // normalized "12.65" form (period decimal)
+        val currencyCode: String?, // ISO 4217: USD / GBP / EUR / etc.
+    ) {
+        fun formatted(): String =
+            if (currencyCode.isNullOrBlank()) amount else "$currencyCode $amount"
+
+        /** Compact form for filenames: "GBP12.65", or just "12.65" when no
+         *  currency is known. No spaces; safe in any filesystem. */
+        fun compactForFilename(): String =
+            if (currencyCode.isNullOrBlank()) amount else "$currencyCode$amount"
+    }
 
     suspend fun parse(bitmap: Bitmap): Info {
         val text = runCatching { recognize(bitmap) }.getOrDefault("")
@@ -34,6 +51,7 @@ object ReceiptParser {
             date = detectDateInText(text),
             location = AddressParser.extractLocation(text),
             isMeal = detectMeal(text),
+            total = detectTotal(text),
             rawText = text,
         )
     }
@@ -47,6 +65,108 @@ object ReceiptParser {
 
     fun formatDateForFilename(date: LocalDate): String =
         date.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"))
+
+    // --- total + currency ---------------------------------------------------
+
+    /** Total-line keywords in priority order. The first one that matches a
+     *  line wins; receipts that print BOTH "SUBTOTAL" and "TOTAL" will pick
+     *  TOTAL because SUBTOTAL doesn't appear in this list (subtotal is the
+     *  amount before tax — corporate audit cares about the actual total). */
+    private val TOTAL_KEYWORDS = listOf(
+        "GRAND TOTAL",
+        "TOTAL DUE",
+        "AMOUNT DUE",
+        "BALANCE DUE",
+        "AMOUNT PAID",
+        "OUT TOTAL",
+        "INCL VAT",
+        "INCL TAX",
+        "TOTAL",
+        "BALANCE",
+        "AMOUNT",
+    )
+
+    private val CURRENCY_SYMBOL_TO_CODE = mapOf(
+        "$" to "USD",
+        "£" to "GBP",
+        "€" to "EUR",
+        "¥" to "JPY",
+        "₹" to "INR",
+        "₩" to "KRW",
+        "₽" to "RUB",
+        "₺" to "TRY",
+    )
+
+    private val CURRENCY_CODES = setOf(
+        "USD", "GBP", "EUR", "JPY", "CAD", "AUD", "INR", "KRW", "CHF",
+        "CNY", "HKD", "SGD", "NZD", "MXN", "BRL", "SEK", "NOK", "DKK",
+        "PLN", "ZAR", "AED", "SAR", "TRY", "RUB",
+    )
+
+    /** Find the printed total. Walks lines bottom-up because totals
+     *  conventionally print near the end of a receipt; the first label
+     *  match wins. Returns null when no labeled total amount can be
+     *  found — uncommon for proper receipts but possible for partial
+     *  captures or hand-written notes. */
+    fun detectTotal(text: String): Total? {
+        val lines = text.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+        if (lines.isEmpty()) return null
+
+        for (keyword in TOTAL_KEYWORDS) {
+            // Pattern: keyword (with arbitrary punctuation/space) then
+            // optionally a currency symbol or 3-letter code, then the
+            // amount (1–6 integer digits, period or comma decimal,
+            // 2 fractional digits).
+            val pattern = Regex(
+                "\\b" + Regex.escape(keyword) + "\\b" +
+                    "[^\\d]{0,40}" +                       // up to 40 chars of separator/label noise
+                    "([\\$£€¥₹₩₽₺]|[A-Z]{3})?\\s*" +       // optional currency before
+                    "([\\$£€¥₹₩₽₺])?\\s*" +                // optional symbol immediately before number
+                    "(\\d{1,6}[.,]\\d{2})\\b",             // amount
+                RegexOption.IGNORE_CASE,
+            )
+            // Search bottom-up — totals are at the end of receipts.
+            for (line in lines.asReversed()) {
+                val m = pattern.find(line) ?: continue
+                val firstToken = m.groupValues[1]
+                val symbol2 = m.groupValues[2]
+                val rawAmount = m.groupValues[3]
+
+                val explicitSymbol = listOf(firstToken, symbol2)
+                    .firstOrNull { it.isNotBlank() && it.length == 1 }
+                    .orEmpty()
+                val explicitCode = listOf(firstToken, symbol2)
+                    .firstOrNull { it.length == 3 && it.uppercase() in CURRENCY_CODES }
+                    ?.uppercase()
+
+                val currency = when {
+                    explicitCode != null -> explicitCode
+                    explicitSymbol.isNotBlank() -> CURRENCY_SYMBOL_TO_CODE[explicitSymbol]
+                    else -> detectCurrencyFromText(text)
+                }
+                val amount = rawAmount.replace(",", ".")
+                return Total(amount = amount, currencyCode = currency)
+            }
+        }
+        return null
+    }
+
+    /** Last-resort currency inference: scan the whole receipt for an ISO
+     *  code or a currency symbol. Used when the total line itself doesn't
+     *  carry one but the receipt header / footer does. */
+    private fun detectCurrencyFromText(text: String): String? {
+        val upper = text.uppercase()
+        for (code in CURRENCY_CODES) {
+            if (Regex("\\b$code\\b").containsMatchIn(upper)) return code
+        }
+        for ((sym, code) in CURRENCY_SYMBOL_TO_CODE) {
+            if (sym in text) return code
+        }
+        return null
+    }
 
     // --- meal detection -----------------------------------------------------
 

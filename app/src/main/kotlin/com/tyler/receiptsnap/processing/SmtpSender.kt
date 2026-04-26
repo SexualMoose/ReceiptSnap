@@ -36,7 +36,10 @@ object SmtpSender {
     private const val TAG = "SmtpSender"
 
     sealed interface SendResult {
-        data object Success : SendResult
+        /** [messageId] is the RFC 5322 Message-ID header value the SMTP
+         *  server confirmed (no surrounding angle brackets). Useful for
+         *  matching delivery / bounce reports later. */
+        data class Success(val messageId: String?) : SendResult
         data class Failure(val message: String, val cause: Throwable?) : SendResult
     }
 
@@ -67,8 +70,13 @@ object SmtpSender {
             return try {
                 val msg = buildMessage(session, fromEmail, toEmail, subject, bodyText, attachment)
                 transport.sendMessage(msg, msg.allRecipients)
-                Log.i(TAG, "Sent ${attachment.name} to $toEmail")
-                SendResult.Success
+                // saveChanges() in buildMessage finalized the headers, so
+                // Message-ID is now populated. Strip the angle brackets
+                // for downstream matching against IMAP search results.
+                val rawId = msg.getHeader("Message-ID")?.firstOrNull()
+                val messageId = rawId?.trim()?.removePrefix("<")?.removeSuffix(">")
+                Log.i(TAG, "Sent ${attachment.name} to $toEmail (id=$messageId)")
+                SendResult.Success(messageId)
             } catch (t: Throwable) {
                 Log.e(TAG, "sendMessage failed", t)
                 SendResult.Failure(friendlyMessage(t), t)

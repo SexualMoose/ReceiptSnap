@@ -343,7 +343,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 } ?: return@forEachIndexed
 
                 val info = runCatching { ReceiptParser.parse(cropped) }
-                    .getOrElse { ReceiptParser.Info(null, null, false, "") }
+                    .getOrElse { ReceiptParser.Info(null, null, false, null, "") }
 
                 val result = runCatching {
                     ReceiptStorage.save(
@@ -352,6 +352,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         date = info.date,
                         location = info.location,
                         isMeal = info.isMeal,
+                        total = info.total,
                     )
                 }.onFailure { Log.e(TAG, "Save failed", it) }.getOrNull()
 

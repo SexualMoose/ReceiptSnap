@@ -9,10 +9,18 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.net.Uri
 import android.util.Log
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Produces a minimal, single-page PDF containing the receipt as an embedded
@@ -67,6 +75,8 @@ object PdfMaker {
     fun outputDir(context: Context): File =
         File(context.cacheDir, "coupa_pdfs").apply { mkdirs() }
 
+    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
     fun makePdf(
         context: Context,
         imageUri: Uri,
@@ -75,6 +85,7 @@ object PdfMaker {
         maxWidthPx: Int = DEFAULT_MAX_WIDTH_PX,
         jpegQuality: Int = JPEG_QUALITY,
         desaturate: Boolean = true,
+        searchable: Boolean = true,
     ): File {
         val safeName = baseName.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "receipt" }
         val outFile = File(outputDir, "$safeName.pdf")
@@ -82,12 +93,23 @@ object PdfMaker {
         val color = loadBitmap(context, imageUri, maxWidthPx)
             ?: error("Could not decode $imageUri")
 
+        // Recognize text BEFORE desaturating so the recognizer sees the
+        // original color image (slightly better recall on color logos and
+        // anti-aliased glyphs). Skip when [searchable] is false to save
+        // ~300-500 ms on flows that don't need a text layer.
+        val textLines: List<TextLineRecord> = if (searchable) {
+            try {
+                recognizeLineRecords(color)
+            } catch (t: Throwable) {
+                Log.w("PdfMaker", "OCR for searchable layer failed; embedding image only", t)
+                emptyList()
+            }
+        } else emptyList()
+
         val processed = try {
             if (desaturate) desaturate(color) else color
         } catch (t: Throwable) { color.recycle(); throw t }
 
-        // When we desaturated, `processed` is a new bitmap; otherwise it's
-        // the same object. Handle recycle carefully.
         val ownsProcessed = processed !== color
         if (ownsProcessed) color.recycle()
 
@@ -103,14 +125,55 @@ object PdfMaker {
         }
 
         FileOutputStream(outFile).use { os ->
-            writePdf(os, jpegBytes, bmpW, bmpH)
+            writePdf(os, jpegBytes, bmpW, bmpH, textLines)
         }
         Log.i(
             "PdfMaker",
             "Wrote ${outFile.name}: ${outFile.length() / 1024} KB " +
-                "(jpeg ${jpegBytes.size / 1024} KB, ${bmpW}×${bmpH}, q=$jpegQuality, gray=$desaturate)",
+                "(jpeg ${jpegBytes.size / 1024} KB, ${bmpW}×${bmpH}, q=$jpegQuality, gray=$desaturate, text=${textLines.size})",
         )
         return outFile
+    }
+
+    /** One OCR'd line position in source-bitmap pixel space. Used as input
+     *  to the searchable-PDF text layer. */
+    private data class TextLineRecord(
+        val text: String,
+        // Tight bounding box in pre-desaturate bitmap pixels.
+        val x: Int,
+        val y: Int,
+        val w: Int,
+        val h: Int,
+    )
+
+    /** Run ML Kit on the source bitmap synchronously (we're already on a
+     *  worker thread for the whole PdfMaker.makePdf call) and collect each
+     *  recognized line's text + bounding box. */
+    private fun recognizeLineRecords(bitmap: Bitmap): List<TextLineRecord> {
+        val result = runBlocking {
+            suspendCancellableCoroutine<Text> { cont ->
+                recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                    .addOnSuccessListener { cont.resume(it) }
+                    .addOnFailureListener { cont.resumeWithException(it) }
+            }
+        }
+        val out = mutableListOf<TextLineRecord>()
+        for (block in result.textBlocks) {
+            for (line in block.lines) {
+                val box = line.boundingBox ?: continue
+                if (box.width() <= 0 || box.height() <= 0) continue
+                val text = line.text.trim()
+                if (text.isEmpty()) continue
+                out += TextLineRecord(
+                    text = text,
+                    x = box.left.coerceAtLeast(0),
+                    y = box.top.coerceAtLeast(0),
+                    w = box.width(),
+                    h = box.height(),
+                )
+            }
+        }
+        return out
     }
 
     /**
@@ -174,6 +237,33 @@ object PdfMaker {
             "Passthrough ${outFile.name}: ${outFile.length() / 1024} KB (re-encoded q=95, ${w}×${h})",
         )
         return outFile
+    }
+
+    /** Escape a Kotlin string for safe inclusion inside a PDF literal
+     *  string `(…)`. PDF requires escaping of `(`, `)`, and `\`; we also
+     *  drop control characters that could break parsers. Encoded as
+     *  WinAnsi (best fit for Helvetica's default encoding) — non-ASCII
+     *  glyphs render as `?` since we don't ship a Unicode font. The
+     *  substitution doesn't matter visually because the text is invisible;
+     *  it only affects search/copy. */
+    private fun escapePdfString(s: String): String {
+        val sb = StringBuilder(s.length + 8)
+        for (c in s) {
+            when (c) {
+                '\\' -> sb.append("\\\\")
+                '(' -> sb.append("\\(")
+                ')' -> sb.append("\\)")
+                '\r' -> sb.append("\\r")
+                '\n' -> sb.append(' ')
+                '\t' -> sb.append(' ')
+                else -> {
+                    if (c.code in 32..126) sb.append(c)
+                    else if (c.code in 0xA0..0xFF) sb.append(c)
+                    else sb.append('?')
+                }
+            }
+        }
+        return sb.toString()
     }
 
     /** Minimal JPEG SOF-marker parser. Walks the JPEG segments until it
@@ -254,7 +344,13 @@ object PdfMaker {
      * content stream places a single image on the page, fit to margins with
      * preserved aspect ratio.
      */
-    private fun writePdf(out: OutputStream, jpegBytes: ByteArray, imgW: Int, imgH: Int) {
+    private fun writePdf(
+        out: OutputStream,
+        jpegBytes: ByteArray,
+        imgW: Int,
+        imgH: Int,
+        textLines: List<TextLineRecord> = emptyList(),
+    ) {
         val availW = PAGE_W_PT - 2 * MARGIN_PT
         val drawW = availW
         val drawH = drawW * imgH.toFloat() / imgW
@@ -262,17 +358,46 @@ object PdfMaker {
         val x = MARGIN_PT
         val y = (pageH - drawH) / 2f
 
-        // Content stream: save graphics state, set up transform so the unit
-        // 1×1 image covers (drawW × drawH), paint the image, restore.
+        // Content stream: paint the image, then optionally lay invisible
+        // text on top of it at the correct line positions so PDF readers
+        // and Coupa's downstream OCR can extract text without re-OCRing
+        // the JPEG. Invisible text uses rendering mode 3 (clip-no-fill).
         val contentStreamBytes = buildString {
+            // Image rendering
             append("q\n")
             append("%.4f 0 0 %.4f %.4f %.4f cm\n".format(drawW, drawH, x, y))
             append("/Im1 Do\n")
             append("Q\n")
+            // Invisible text layer
+            if (textLines.isNotEmpty()) {
+                // BT … ET demarcates the text-object block.
+                // 3 Tr selects "invisible text" rendering mode — glyphs
+                // contribute nothing to the painted page but remain in
+                // the text stream for selection / search / OCR-by-reader.
+                append("BT\n")
+                append("3 Tr\n")
+                for (line in textLines) {
+                    val pdfX = x + (line.x.toFloat() / imgW) * drawW
+                    // PDF y is bottom-up; flip the image-space y.
+                    val pdfYBaseline = y + drawH -
+                        ((line.y + line.h).toFloat() / imgH) * drawH
+                    val fontSize = (line.h.toFloat() / imgH) * drawH
+                    append("/F1 %.3f Tf\n".format(fontSize.coerceAtLeast(1f)))
+                    append("%.4f %.4f Td\n".format(pdfX, pdfYBaseline))
+                    append("(${escapePdfString(line.text)}) Tj\n")
+                    // Tm/Td reset on next line — easiest is to emit an
+                    // absolute matrix per line via Tm. Td is relative;
+                    // reset the text matrix between lines so positions
+                    // are independent.
+                    append("1 0 0 1 0 0 Tm\n")
+                }
+                append("ET\n")
+            }
         }.toByteArray(Charsets.US_ASCII)
 
         val buf = ByteArrayOutputStream(jpegBytes.size + 1024)
-        val offsets = IntArray(6)  // offsets[1..5] for objects 1..5
+        // Six objects total now: catalog, pages, page, content, image, font.
+        val offsets = IntArray(7)  // offsets[1..6] for objects 1..6
 
         fun writeAscii(s: String) = buf.write(s.toByteArray(Charsets.US_ASCII))
         fun writeBytes(b: ByteArray) = buf.write(b)
@@ -295,7 +420,9 @@ object PdfMaker {
         writeAscii(
             "3 0 obj\n<< /Type /Page /Parent 2 0 R " +
                 "/MediaBox [0 0 %.2f %.2f] ".format(PAGE_W_PT, pageH) +
-                "/Resources << /XObject << /Im1 5 0 R >> /ProcSet [/PDF /ImageC] >> " +
+                "/Resources << /XObject << /Im1 5 0 R >> " +
+                "/Font << /F1 6 0 R >> " +
+                "/ProcSet [/PDF /ImageC /Text] >> " +
                 "/Contents 4 0 R >>\nendobj\n"
         )
 
@@ -319,16 +446,24 @@ object PdfMaker {
         writeBytes(jpegBytes)
         writeAscii("\nendstream\nendobj\n")
 
+        // 6: Font — built-in Helvetica. Standard 14 PDF fonts don't need
+        // an embedded program; readers ship them. Plenty good for
+        // invisible search-layer text.
+        offsets[6] = buf.size()
+        writeAscii(
+            "6 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n"
+        )
+
         // xref table
         val xrefOffset = buf.size()
-        writeAscii("xref\n0 6\n")
+        writeAscii("xref\n0 7\n")
         writeAscii("0000000000 65535 f \n")
-        for (i in 1..5) {
+        for (i in 1..6) {
             writeAscii("%010d 00000 n \n".format(offsets[i]))
         }
 
         // Trailer
-        writeAscii("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n$xrefOffset\n%%EOF\n")
+        writeAscii("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n$xrefOffset\n%%EOF\n")
 
         out.write(buf.toByteArray())
     }

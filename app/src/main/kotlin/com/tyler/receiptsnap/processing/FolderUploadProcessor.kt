@@ -71,10 +71,15 @@ object FolderUploadProcessor {
                     ReceiptParser.parse(warped)
                 } catch (t: Throwable) {
                     Log.w(TAG, "parse failed; using fallback name", t)
-                    ReceiptParser.Info(null, null, false, "")
+                    ReceiptParser.Info(null, null, false, null, "")
                 }
 
-                val baseName = ReceiptStorage.buildDisplayName(info.date, info.location, info.isMeal)
+                val baseName = ReceiptStorage.buildDisplayName(
+                    date = info.date,
+                    location = info.location,
+                    isMeal = info.isMeal,
+                    total = info.total,
+                )
                 val uniqueName = uniqify(baseName, usedNames)
                 usedNames += uniqueName
 

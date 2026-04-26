@@ -41,9 +41,10 @@ object ReceiptStorage {
         date: LocalDate?,
         location: String?,
         isMeal: Boolean,
+        total: ReceiptParser.Total? = null,
     ): SaveResult {
         val resolver = context.contentResolver
-        val baseName = buildBaseName(date, location, isMeal)
+        val baseName = buildBaseName(date, location, isMeal, total)
         val uniqueName = allocateUniqueName(resolver, baseName, date, location, isMeal)
 
         val values = ContentValues().apply {
@@ -97,15 +98,27 @@ object ReceiptStorage {
 
     /** Public variant for callers (e.g. folder-upload pre-processing) that
      *  need the same naming convention but write to their own destination. */
-    fun buildDisplayName(date: LocalDate?, location: String?, isMeal: Boolean): String =
-        buildBaseName(date, location, isMeal)
+    fun buildDisplayName(
+        date: LocalDate?,
+        location: String?,
+        isMeal: Boolean,
+        total: ReceiptParser.Total? = null,
+    ): String = buildBaseName(date, location, isMeal, total)
 
-    private fun buildBaseName(date: LocalDate?, location: String?, isMeal: Boolean): String {
+    private fun buildBaseName(
+        date: LocalDate?,
+        location: String?,
+        isMeal: Boolean,
+        total: ReceiptParser.Total? = null,
+    ): String {
         val sanitizedLoc = location?.let(::sanitize)?.takeIf { it.isNotBlank() }
         val dateStr = date?.let(ReceiptParser::formatDateForFilename)
         val parts = mutableListOf<String>()
         if (dateStr != null) parts += dateStr
         if (sanitizedLoc != null) parts += sanitizedLoc
+        // Amount embedded in filename helps when corporate audit asks
+        // "find me the receipt for the £12.65 charge from April".
+        if (total != null) parts += total.compactForFilename()
         if (isMeal) parts += "meal"
         return when {
             parts.isEmpty() -> FALLBACK_BASE

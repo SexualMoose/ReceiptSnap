@@ -14,6 +14,7 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
@@ -62,10 +63,34 @@ class CameraController(private val context: Context) {
     )
 
     private val executor = Executors.newSingleThreadExecutor()
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val recognizer = com.google.mlkit.vision.text.TextRecognition.getClient(
+        com.google.mlkit.vision.text.latin.TextRecognizerOptions.DEFAULT_OPTIONS
+    )
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
     private var provider: ProcessCameraProvider? = null
     private var boundPhysicalId: String? = null
+
+    /** Live preview-frame quality signal: text-line count + frame luma.
+     *  CameraScreen renders a small badge from this so the user can tell
+     *  whether the camera is seeing enough of the receipt before they
+     *  pull the trigger on the (slow) multi-camera capture. */
+    enum class QualityLevel { Poor, Fair, Good }
+
+    data class PreviewQuality(
+        val textLineCount: Int = 0,
+        val luma: Int = 0,         // 0..255
+        val level: QualityLevel = QualityLevel.Poor,
+    )
+
+    private val _previewQuality = kotlinx.coroutines.flow.MutableStateFlow(PreviewQuality())
+    val previewQuality: kotlinx.coroutines.flow.StateFlow<PreviewQuality> = _previewQuality
+
+    /** Throttle: ML Kit calls are ~150-300 ms each. Skip frames in between
+     *  so the analyzer doesn't pile up. */
+    @Volatile private var lastAnalysisAtMs = 0L
+    private val ANALYSIS_INTERVAL_MS = 750L
 
     /** Populated once on first bind. Ordered by focal length ascending. */
     private var knownLenses: List<CameraLens> = emptyList()
@@ -158,10 +183,63 @@ class CameraController(private val context: Context) {
 
     fun release() {
         executor.shutdown()
+        analysisExecutor.shutdown()
         camera = null
         imageCapture = null
         provider = null
         boundPhysicalId = null
+    }
+
+    /** Analyzer hook: every ANALYSIS_INTERVAL_MS we run ML Kit on the
+     *  latest preview frame and update [previewQuality]. Frames in between
+     *  are released immediately to keep latency low. The analyzer MUST
+     *  close the proxy exactly once per call or CameraX will stop feeding
+     *  frames; every code path in here handles that. */
+    private fun analyzeFrame(proxy: ImageProxy) {
+        val now = System.currentTimeMillis()
+        if (now - lastAnalysisAtMs < ANALYSIS_INTERVAL_MS) {
+            proxy.close(); return
+        }
+        lastAnalysisAtMs = now
+
+        val mediaImage = proxy.image
+        if (mediaImage == null) { proxy.close(); return }
+
+        try {
+            // Mean luma from the Y plane — single-byte stride, 4096 sample
+            // points across the buffer is enough to detect a pitch-black
+            // or blown-out frame without scanning everything.
+            val yPlane = mediaImage.planes[0]
+            val buffer = yPlane.buffer
+            val sampleCount = 4096
+            val step = (buffer.remaining() / sampleCount).coerceAtLeast(1)
+            var lumaSum = 0L
+            var taken = 0
+            var i = 0
+            while (i < buffer.remaining()) {
+                lumaSum += (buffer.get(i).toInt() and 0xFF); taken++; i += step
+            }
+            val luma = if (taken > 0) (lumaSum / taken).toInt() else 0
+
+            val mlImage = com.google.mlkit.vision.common.InputImage.fromMediaImage(
+                mediaImage, proxy.imageInfo.rotationDegrees,
+            )
+            recognizer.process(mlImage)
+                .addOnSuccessListener { result ->
+                    val lineCount = result.textBlocks.sumOf { it.lines.size }
+                    val level = when {
+                        lineCount >= 10 && luma in 80..230 -> QualityLevel.Good
+                        lineCount >= 3 -> QualityLevel.Fair
+                        else -> QualityLevel.Poor
+                    }
+                    _previewQuality.value = PreviewQuality(lineCount, luma, level)
+                }
+                .addOnFailureListener { /* keep prior reading on transient errors */ }
+                .addOnCompleteListener { proxy.close() }
+        } catch (t: Throwable) {
+            Log.w(TAG, "preview analyze frame failed", t)
+            proxy.close()
+        }
     }
 
     // --- internals ----------------------------------------------------------
@@ -263,7 +341,28 @@ class CameraController(private val context: Context) {
         val selector = selectorBuilder.build()
 
         val capture = captureBuilder.build()
-        camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, capture)
+
+        // ImageAnalysis: low-res preview-frame stream we run ML Kit and a
+        // luma sample on. KEEP_ONLY_LATEST means the analyzer never falls
+        // behind — if we're slow on a frame, the next one in flight is
+        // dropped. Output 1280×720-ish is plenty for a "is there text?"
+        // check and keeps OCR fast.
+        val analysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(1280, 720),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER,
+                        )
+                    )
+                    .build()
+            )
+            .build()
+            .apply { setAnalyzer(analysisExecutor, ::analyzeFrame) }
+
+        camera = cameraProvider.bindToLifecycle(lifecycleOwner, selector, preview, capture, analysis)
         imageCapture = capture
         boundPhysicalId = lens?.physicalId
 

@@ -69,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.tyler.receiptsnap.ReceiptSnapApp
 import com.tyler.receiptsnap.processing.CoupaUploadsFolder
+import com.tyler.receiptsnap.processing.EmailContent
 import com.tyler.receiptsnap.processing.FolderUploadProcessor
 import com.tyler.receiptsnap.processing.PdfMaker
 import com.tyler.receiptsnap.processing.ReceiptsSortedFolder
@@ -130,6 +131,7 @@ private suspend fun runSendPass(
     recipient: String,
     context: android.content.Context,
     sentTracker: com.tyler.receiptsnap.data.SentTracker,
+    sendLog: com.tyler.receiptsnap.data.SendLog,
     onSuccess: suspend (LibraryItem) -> Unit,
     currentQueue: () -> List<LibraryItem>,
 ): PassOutcome {
@@ -193,8 +195,8 @@ private suspend fun runSendPass(
                             }
                             conn.send(
                                 toEmail = recipient,
-                                subject = baseName,
-                                bodyText = "Receipt attached (sent from ReceiptSnap).",
+                                subject = EmailContent.subjectFor(baseName),
+                                bodyText = EmailContent.bodyFor(baseName),
                                 attachment = pdf,
                             )
                         } catch (t: Throwable) {
@@ -204,6 +206,13 @@ private suspend fun runSendPass(
                         when (result) {
                             is SmtpSender.SendResult.Success -> {
                                 sentTracker.markSent(item.uri)
+                                sendLog.record(
+                                    receiptName = item.name,
+                                    recipient = recipient,
+                                    fromAccount = account.email,
+                                    messageId = result.messageId,
+                                    smtpHost = "${account.host}:${account.port}",
+                                )
                                 if (item.moveAfterSend) {
                                     val srcUri = item.sourceUri
                                     val srcName = item.sourceName
@@ -307,6 +316,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
     val app = context.applicationContext as ReceiptSnapApp
     val settings = app.settings
     val sentTracker = app.sentTracker
+    val sendLog = app.sendLog
     val sentSet by sentTracker.sent.collectAsState()
 
     var refreshTick by remember { mutableIntStateOf(0) }
@@ -424,6 +434,7 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
                         recipient = recipient,
                         context = context,
                         sentTracker = sentTracker,
+                        sendLog = sendLog,
                         onSuccess = { item ->
                             withContext(Dispatchers.Main) {
                                 sendQueue = sendQueue - item

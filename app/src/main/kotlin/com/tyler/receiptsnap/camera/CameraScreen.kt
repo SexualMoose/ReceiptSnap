@@ -21,9 +21,12 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -48,6 +51,7 @@ fun CameraScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val controller = remember { CameraController(context) }
     val previewViewState = remember { mutableStateOf<PreviewView?>(null) }
+    val quality by controller.previewQuality.collectAsState()
 
     Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
         AndroidView(
@@ -58,6 +62,17 @@ fun CameraScreen(
                     implementationMode = PreviewView.ImplementationMode.PERFORMANCE
                 }.also { previewViewState.value = it }
             },
+        )
+
+        // Live capture-quality badge. Tells the user whether the camera
+        // is currently seeing enough text to be worth taking a 5-second
+        // multi-camera capture. Updates ~once per second from a CameraX
+        // ImageAnalysis stream running ML Kit on a 720p preview frame.
+        QualityBadge(
+            quality = quality,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(start = 12.dp, top = 16.dp),
         )
 
         LaunchedEffect(previewViewState.value) {
@@ -137,6 +152,47 @@ fun CameraScreen(
                 text = "Lay receipts flat with space between them",
                 color = Color.White.copy(alpha = 0.7f),
                 style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun QualityBadge(
+    quality: CameraController.PreviewQuality,
+    modifier: Modifier = Modifier,
+) {
+    val (label, dotColor) = when (quality.level) {
+        CameraController.QualityLevel.Good -> "Receipt looks good" to Color(0xFF00E5A0)
+        CameraController.QualityLevel.Fair -> "Get closer · steadier" to Color(0xFFFFC857)
+        CameraController.QualityLevel.Poor -> "Frame the receipt" to Color(0xFFFF5C5C)
+    }
+    androidx.compose.foundation.layout.Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .background(
+                color = Color.Black.copy(alpha = 0.55f),
+                shape = RoundedCornerShape(50),
+            )
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .background(dotColor, shape = RoundedCornerShape(50))
+        )
+        Spacer(Modifier.size(8.dp))
+        Text(
+            text = label,
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+        )
+        if (quality.textLineCount > 0) {
+            Spacer(Modifier.size(8.dp))
+            Text(
+                text = "${quality.textLineCount} lines",
+                color = Color.White.copy(alpha = 0.65f),
+                style = MaterialTheme.typography.labelSmall,
             )
         }
     }
