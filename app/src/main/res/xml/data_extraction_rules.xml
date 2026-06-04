@@ -1,2 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<data-extraction-rules />
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Exclude SMTP credentials and send log from cloud backup.
+             The settings pref contains passwords; the send_log pref is
+             device-specific history that shouldn't roam. -->
+        <exclude domain="sharedpref" path="receipt_snap_settings.xml" />
+        <exclude domain="sharedpref" path="send_log.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <!-- Same exclusions for device-to-device (D2D) transfer. -->
+        <exclude domain="sharedpref" path="receipt_snap_settings.xml" />
+        <exclude domain="sharedpref" path="send_log.xml" />
+    </device-transfer>
+</data-extraction-rules>

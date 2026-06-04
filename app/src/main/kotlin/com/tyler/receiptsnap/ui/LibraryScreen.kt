@@ -176,8 +176,9 @@ private suspend fun runSendPass(
                         val baseName = item.name
                             .removeSuffix(".jpg").removeSuffix(".jpeg")
                             .removeSuffix(".png").removeSuffix(".webp")
+                        var pdf: java.io.File? = null
                         val result = try {
-                            val pdf = if (item.pdfPassthrough) {
+                            pdf = if (item.pdfPassthrough) {
                                 PdfMaker.makePdfPassthrough(
                                     context = context,
                                     imageUri = item.uri,
@@ -201,6 +202,10 @@ private suspend fun runSendPass(
                             )
                         } catch (t: Throwable) {
                             SmtpSender.SendResult.Failure("Prepare failed: ${t.message}", t)
+                        } finally {
+                            // Always delete the generated PDF temp file after
+                            // the send attempt, whether it succeeded or failed.
+                            runCatching { pdf?.delete() }
                         }
 
                         when (result) {
@@ -357,7 +362,18 @@ fun LibraryScreen(modifier: Modifier = Modifier) {
 
 
     LaunchedEffect(refreshTick) {
-        items = withContext(Dispatchers.IO) { loadItems(context) }
+        items = withContext(Dispatchers.IO) {
+            // Purge any PDF temp files older than 24 h that were left behind
+            // by a crash or a send that never reached the finally block.
+            val maxAgeMs = 24L * 60 * 60 * 1000
+            val now = System.currentTimeMillis()
+            runCatching {
+                PdfMaker.outputDir(context).listFiles()?.forEach { f ->
+                    if (now - f.lastModified() > maxAgeMs) f.delete()
+                }
+            }
+            loadItems(context)
+        }
         // Prune the sent set for entries whose files no longer exist so it
         // can't grow unboundedly across deletes.
         sentTracker.retain(items.map { it.uri.toString() }.toSet())

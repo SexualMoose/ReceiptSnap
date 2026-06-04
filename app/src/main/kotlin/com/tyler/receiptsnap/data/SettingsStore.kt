@@ -279,8 +279,8 @@ class SettingsStore(context: Context) {
         private const val KEY_ACTIVE_ID = "smtp_active_account_id"
         private const val KEY_FAILOVER = "smtp_failover_enabled"
 
-        private const val DEFAULT_HOST = "bdpinternational.coupahost.com"
-        private const val DEFAULT_EMAIL = "Tyler.Keller@psabdp.com"
+        private const val DEFAULT_HOST = ""
+        private const val DEFAULT_EMAIL = ""
         private const val DEFAULT_SMTP_HOST = "smtp.office365.com"
         private const val DEFAULT_SMTP_PORT = 587
 

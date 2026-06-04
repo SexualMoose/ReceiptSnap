@@ -14,7 +14,6 @@ import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -77,7 +76,7 @@ object PdfMaker {
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
-    fun makePdf(
+    suspend fun makePdf(
         context: Context,
         imageUri: Uri,
         outputDir: File,
@@ -146,16 +145,13 @@ object PdfMaker {
         val h: Int,
     )
 
-    /** Run ML Kit on the source bitmap synchronously (we're already on a
-     *  worker thread for the whole PdfMaker.makePdf call) and collect each
-     *  recognized line's text + bounding box. */
-    private fun recognizeLineRecords(bitmap: Bitmap): List<TextLineRecord> {
-        val result = runBlocking {
-            suspendCancellableCoroutine<Text> { cont ->
-                recognizer.process(InputImage.fromBitmap(bitmap, 0))
-                    .addOnSuccessListener { cont.resume(it) }
-                    .addOnFailureListener { cont.resumeWithException(it) }
-            }
+    /** Run ML Kit on the source bitmap and collect each recognized line's
+     *  text + bounding box. Must be called from a coroutine context. */
+    private suspend fun recognizeLineRecords(bitmap: Bitmap): List<TextLineRecord> {
+        val result = suspendCancellableCoroutine<Text> { cont ->
+            recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                .addOnSuccessListener { cont.resume(it) }
+                .addOnFailureListener { cont.resumeWithException(it) }
         }
         val out = mutableListOf<TextLineRecord>()
         for (block in result.textBlocks) {
